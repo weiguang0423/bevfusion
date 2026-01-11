@@ -1,0 +1,24 @@
+# 无CUDA环境测试依赖
+# 用于在没有GPU/CUDA编译的环境下运行雷达分支相关测试
+#
+# 使用方法:
+#   pip install -r requirements/tests_no_cuda.txt
+#   pytest tests/test_datasets/test_transforms/test_radar_*.py -v
+#
+# 注意: 这些测试只验证数据加载和预处理模块，
+# 不包含需要CUDA扩展的模型测试。
+
+# 基础测试依赖
+pytest
+pytest-cov
+numpy
+
+# mmdetection3d 核心依赖（不需要CUDA扩展）
+torch>=1.8
+mmcv>=2.0.0
+mmengine>=0.7.0
+mmdet>=3.0.0
+
+# 可选：用于代码质量检查
+flake8
+isort
