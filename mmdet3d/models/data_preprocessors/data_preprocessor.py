@@ -204,6 +204,27 @@ class Det3DDataPreprocessor(DetDataPreprocessor):
                 for batch_aug in self.batch_augments:
                     imgs, data_samples = batch_aug(imgs, data_samples)
             batch_inputs['imgs'] = imgs
+        
+        # 处理深度GT（如果存在）- 需要将列表堆叠成张量
+        if 'depth_gt_indices' in inputs:
+            depth_gt_list = inputs['depth_gt_indices']
+            if isinstance(depth_gt_list, list) and len(depth_gt_list) > 0:
+                # 将numpy数组转换为张量，然后堆叠成 [B, N, fH, fW]
+                depth_gt_tensors = [torch.from_numpy(dgt) if isinstance(dgt, np.ndarray) else dgt 
+                                   for dgt in depth_gt_list]
+                batch_inputs['depth_gt_indices'] = torch.stack(depth_gt_tensors, dim=0)
+            else:
+                batch_inputs['depth_gt_indices'] = depth_gt_list
+                
+        if 'depth_valid_mask' in inputs:
+            depth_mask_list = inputs['depth_valid_mask']
+            if isinstance(depth_mask_list, list) and len(depth_mask_list) > 0:
+                # 将numpy数组转换为张量，然后堆叠成 [B, N, fH, fW]
+                depth_mask_tensors = [torch.from_numpy(dvm) if isinstance(dvm, np.ndarray) else dvm 
+                                     for dvm in depth_mask_list]
+                batch_inputs['depth_valid_mask'] = torch.stack(depth_mask_tensors, dim=0)
+            else:
+                batch_inputs['depth_valid_mask'] = depth_mask_list
 
         return {'inputs': batch_inputs, 'data_samples': data_samples}
 

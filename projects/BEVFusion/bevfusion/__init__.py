@@ -13,12 +13,19 @@ import warnings
 # 数据加载模块
 from .loading import (BEVLoadMultiViewImageFromFiles, 
                       LoadRadarPointsFromFile,
-                      LoadRadarPointsFromMultiSweeps)
+                      LoadRadarPointsFromMultiSweeps,
+                      LoadDepthFromPoints)
 
 # 数据预处理变换模块
 from .transforms_3d import (BEVFusionGlobalRotScaleTrans,
                             BEVFusionRandomFlip3D, GridMask, ImageAug3D,
-                            RadarPointsRangeFilter)
+                            RadarPointsRangeFilter, RadarGeometryEnhancer)
+
+# 雷达速度编码器（非CUDA依赖）
+from .radar_velocity_encoder import (GeometryAwareVelocityEncoder, 
+                                     VelocityRefinementModule,
+                                     RadarVelocityBEVEncoder, 
+                                     VelocityAwareFuser)
 
 # ============ CUDA依赖模块（直接导入以确保注册）============
 # MMEngine 的注册机制需要在模块导入时执行 @MODELS.register_module()
@@ -26,10 +33,12 @@ from .transforms_3d import (BEVFusionGlobalRotScaleTrans,
 try:
     from .bevfusion import BEVFusion, BEVFusionWithRadar
     from .bevfusion_necks import GeneralizedLSSFPN
-    from .depth_lss import DepthLSSTransform, LSSTransform
+    from .depth_lss import (DepthLSSTransform, LSSTransform,
+                           DepthSupervisionLoss, CameraAwareDepthNet,
+                           CameraAwareDepthLSSTransform)
     from .sparse_encoder import BEVFusionSparseEncoder
     from .transformer import TransformerDecoderLayer
-    from .transfusion_head import ConvFuser, TransFusionHead
+    from .transfusion_head import ConvFuser, SEConvFuser, TransFusionHead
     from .utils import (BBoxBEVL1Cost, HeuristicAssigner3D, 
                        HungarianAssigner3D, IoU3DCost)
 except ImportError as e:
@@ -43,11 +52,18 @@ except ImportError as e:
 __all__ = [
     # 非CUDA依赖模块
     'BEVLoadMultiViewImageFromFiles', 'LoadRadarPointsFromFile',
-    'LoadRadarPointsFromMultiSweeps', 'BEVFusionGlobalRotScaleTrans',
+    'LoadRadarPointsFromMultiSweeps', 'LoadDepthFromPoints',
+    'BEVFusionGlobalRotScaleTrans',
     'BEVFusionRandomFlip3D', 'GridMask', 'ImageAug3D', 'RadarPointsRangeFilter',
+    'RadarGeometryEnhancer',
+    # 雷达速度编码器
+    'GeometryAwareVelocityEncoder', 'VelocityRefinementModule',
+    'RadarVelocityBEVEncoder', 'VelocityAwareFuser',  # 向后兼容别名
     # CUDA依赖模块
-    'BEVFusion', 'BEVFusionWithRadar', 'TransFusionHead', 'ConvFuser', 
+    'BEVFusion', 'BEVFusionWithRadar', 'TransFusionHead', 
+    'ConvFuser', 'SEConvFuser',  # 融合器
     'GeneralizedLSSFPN', 'HungarianAssigner3D', 'BBoxBEVL1Cost', 'IoU3DCost', 
-    'HeuristicAssigner3D', 'DepthLSSTransform', 'LSSTransform', 
+    'HeuristicAssigner3D', 'DepthLSSTransform', 'LSSTransform',
+    'DepthSupervisionLoss', 'CameraAwareDepthNet', 'CameraAwareDepthLSSTransform',
     'BEVFusionSparseEncoder', 'TransformerDecoderLayer'
 ]

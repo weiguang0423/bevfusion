@@ -10,7 +10,23 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OPENCV_NUM_THREADS"] = "0"
+# 禁用 NCCL P2P 通信，解决 A800 多卡训练时的句柄错误
+os.environ['NCCL_P2P_DISABLE'] = '1'
+os.environ['NCCL_IB_DISABLE'] = '1'
+# 禁用 CUDA lazy loading，解决某些 CUDA 驱动兼容性问题
+os.environ['CUDA_MODULE_LOADING'] = 'EAGER'
 # ============================================================
+
+import torch
+import torch.multiprocessing as mp
+# 使用spawn方式启动多进程，避免CUDA上下文问题
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
+# 设置线性代数库为default，避免cusolver冲突
+torch.backends.cuda.preferred_linalg_library('default')
 
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log

@@ -796,3 +796,513 @@ class DepthLSSTransform(BaseDepthTransform):
         x = super().forward(*args, **kwargs)
         x = self.downsample(x)
         return x
+
+
+
+@MODELS.register_module()
+class DepthSupervisionLoss(nn.Module):
+    """
+    深度监督损失模块
+    
+    支持两种损失类型：
+    - 'ce': CrossEntropyLoss，直接使用索引格式的GT
+    - 'focal': Focal Loss，处理类别不平衡
+    
+    Args:
+        loss_type (str): 损失类型，'ce' 或 'focal'
+        loss_weight (float): 损失权重
+        focal_gamma (float): Focal Loss的gamma参数，默认2.0
+    """
+    
+    def __init__(
+        self,
+        loss_type: str = 'ce',
+        loss_weight: float = 1.0,
+        focal_gamma: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.loss_type = loss_type
+        self.loss_weight = loss_weight
+        self.focal_gamma = focal_gamma
+    
+    def forward(
+        self,
+        depth_pred: torch.Tensor,  # [B*N, D, fH, fW]
+        depth_gt_indices: torch.Tensor,  # [B*N, fH, fW]，索引格式
+        valid_mask: torch.Tensor,  # [B*N, fH, fW]
+    ) -> torch.Tensor:
+        """
+        计算深度监督损失
+        
+        使用索引格式的GT计算损失，避免One-Hot转换的显存开销
+        
+        Args:
+            depth_pred: 预测的深度分布 [B*N, D, fH, fW]
+            depth_gt_indices: 深度GT索引 [B*N, fH, fW]，无效位置为-1
+            valid_mask: 有效掩码 [B*N, fH, fW]
+            
+        Returns:
+            loss: 深度监督损失
+        """
+        # 如果没有有效像素，返回零损失
+        if valid_mask.sum() == 0:
+            return depth_pred.sum() * 0
+        
+        # 将无效位置标记为-1（CrossEntropyLoss会自动忽略）
+        depth_gt_indices = depth_gt_indices.clone()
+        depth_gt_indices[~valid_mask] = -1
+        
+        if self.loss_type == 'ce':
+            # 使用CrossEntropyLoss，ignore_index=-1自动忽略无效位置
+            loss = torch.nn.functional.cross_entropy(
+                depth_pred,
+                depth_gt_indices,
+                ignore_index=-1,
+                reduction='mean'
+            )
+        else:  # focal loss
+            # Focal Loss实现
+            # 先计算log_softmax
+            log_probs = torch.nn.functional.log_softmax(depth_pred, dim=1)
+            
+            # 获取GT对应的log概率
+            # depth_gt_indices: [B*N, fH, fW]
+            # log_probs: [B*N, D, fH, fW]
+            B, D, H, W = log_probs.shape
+            
+            # 只在有效位置计算损失
+            valid_indices = depth_gt_indices[valid_mask]  # [N_valid]
+            valid_log_probs = log_probs.permute(0, 2, 3, 1)[valid_mask]  # [N_valid, D]
+            
+            # 获取GT对应的log概率
+            gt_log_probs = valid_log_probs[torch.arange(valid_indices.shape[0]), valid_indices]
+            
+            # 计算概率（用于focal weight）
+            gt_probs = torch.exp(gt_log_probs)
+            
+            # Focal Loss: -(1-p)^gamma * log(p)
+            focal_weight = (1 - gt_probs) ** self.focal_gamma
+            loss = -(focal_weight * gt_log_probs).mean()
+        
+        return loss * self.loss_weight
+
+
+@MODELS.register_module()
+class CameraAwareDepthNet(nn.Module):
+    """
+    Camera-Aware深度估计网络
+    
+    将相机参数编码为特征，通过SE机制调制图像特征。
+    
+    Args:
+        in_channels (int): 输入特征通道数
+        mid_channels (int): 中间层通道数
+        depth_channels (int): 深度bin数量
+        context_channels (int): 语义特征通道数
+        embed_dim (int): 相机参数编码维度，默认256
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        mid_channels: int,
+        depth_channels: int,
+        context_channels: int,
+        embed_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.depth_channels = depth_channels
+        self.context_channels = context_channels
+        self.embed_dim = embed_dim
+        
+        # 相机参数编码MLP
+        # 输入: 25维 (内参4 + 外参12 + IDA9)
+        # 输出: embed_dim维
+        self.cam_encoder = nn.Sequential(
+            nn.Linear(25, embed_dim),
+            nn.ReLU(True),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(True),
+        )
+        
+        # SE调制模块
+        # 将相机编码映射到通道注意力权重
+        self.se_layer = nn.Sequential(
+            nn.Linear(embed_dim, in_channels),
+            nn.Sigmoid(),
+        )
+        
+        # 深度预测网络
+        self.depthnet = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(True),
+            nn.Conv2d(mid_channels, mid_channels, 3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(True),
+            nn.Conv2d(mid_channels, depth_channels + context_channels, 1),
+        )
+    
+    def encode_camera_params(
+        self,
+        intrinsics: torch.Tensor,  # [B*N, 3, 3]
+        cam2ego: torch.Tensor,  # [B*N, 4, 4]
+        ida_matrix: torch.Tensor,  # [B*N, 4, 4]
+    ) -> torch.Tensor:
+        """
+        编码相机参数为特征向量
+        
+        Args:
+            intrinsics: 增强后相机内参 [B*N, 3, 3]
+            cam2ego: Camera-to-Ego外参 [B*N, 4, 4]
+            ida_matrix: IDA矩阵 [B*N, 4, 4]
+        
+        Returns:
+            cam_embed: 相机参数编码 [B*N, embed_dim]
+        """
+        BN = intrinsics.shape[0]
+        
+        # 内参: fx, fy, cx, cy (4维)
+        intrinsic_params = torch.stack([
+            intrinsics[:, 0, 0],  # fx
+            intrinsics[:, 1, 1],  # fy
+            intrinsics[:, 0, 2],  # cx
+            intrinsics[:, 1, 2],  # cy
+        ], dim=1)  # [B*N, 4]
+        
+        # 外参: 旋转矩阵展平(9维) + 平移向量(3维) = 12维
+        extrinsic_params = torch.cat([
+            cam2ego[:, :3, :3].reshape(BN, 9),  # 旋转
+            cam2ego[:, :3, 3],  # 平移
+        ], dim=1)  # [B*N, 12]
+        
+        # IDA矩阵: 展平(9维)
+        ida_params = ida_matrix[:, :3, :3].reshape(BN, 9)  # [B*N, 9]
+        
+        # 拼接所有参数: 4 + 12 + 9 = 25维
+        cam_params = torch.cat([
+            intrinsic_params,
+            extrinsic_params,
+            ida_params,
+        ], dim=1)  # [B*N, 25]
+        
+        # 编码相机参数
+        cam_embed = self.cam_encoder(cam_params)  # [B*N, embed_dim]
+        
+        return cam_embed
+    
+    def forward(
+        self,
+        x: torch.Tensor,  # [B*N, C, fH, fW]
+        intrinsics: torch.Tensor,  # [B*N, 3, 3]
+        cam2ego: torch.Tensor,  # [B*N, 4, 4]
+        ida_matrix: torch.Tensor,  # [B*N, 4, 4]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播
+        
+        Args:
+            x: 图像特征 [B*N, C, fH, fW]
+            intrinsics: 增强后相机内参 [B*N, 3, 3]
+            cam2ego: Camera-to-Ego外参 [B*N, 4, 4]
+            ida_matrix: IDA矩阵 [B*N, 4, 4]
+        
+        Returns:
+            depth: 深度分布 [B*N, D, fH, fW]
+            context: 语义特征 [B*N, C, fH, fW]
+        """
+        # 编码相机参数
+        cam_embed = self.encode_camera_params(intrinsics, cam2ego, ida_matrix)
+        
+        # SE调制
+        scale = self.se_layer(cam_embed)  # [B*N, C]
+        scale = scale.unsqueeze(-1).unsqueeze(-1)  # [B*N, C, 1, 1]
+        x = x * scale  # 通道级调制
+        
+        # 深度预测
+        x = self.depthnet(x)  # [B*N, D+C, fH, fW]
+        
+        # 分离深度和语义特征
+        depth = x[:, :self.depth_channels]  # [B*N, D, fH, fW]
+        context = x[:, self.depth_channels:]  # [B*N, C, fH, fW]
+        
+        return depth, context
+
+
+@MODELS.register_module()
+class CameraAwareDepthLSSTransform(DepthLSSTransform):
+    """
+    集成深度监督和Camera-Aware的视角变换模块
+    
+    Args:
+        use_depth_supervision (bool): 是否启用深度监督
+        use_camera_aware (bool): 是否启用Camera-Aware
+        depth_loss_cfg (dict): 深度损失配置
+        camera_aware_cfg (dict): Camera-Aware配置
+        其他参数同DepthLSSTransform
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        image_size: Tuple[int, int],
+        feature_size: Tuple[int, int],
+        xbound: Tuple[float, float, float],
+        ybound: Tuple[float, float, float],
+        zbound: Tuple[float, float, float],
+        dbound: Tuple[float, float, float],
+        downsample: int = 1,
+        use_depth_supervision: bool = False,
+        use_camera_aware: bool = False,
+        depth_loss_cfg: dict = None,
+        camera_aware_cfg: dict = None,
+    ) -> None:
+        """
+        初始化Camera-Aware深度LSS模块
+        
+        Args:
+            use_depth_supervision: 是否启用深度监督
+            use_camera_aware: 是否启用Camera-Aware
+            depth_loss_cfg: 深度损失配置字典
+            camera_aware_cfg: Camera-Aware配置字典
+        """
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            image_size=image_size,
+            feature_size=feature_size,
+            xbound=xbound,
+            ybound=ybound,
+            zbound=zbound,
+            dbound=dbound,
+            downsample=downsample,
+        )
+        
+        self.use_depth_supervision = use_depth_supervision
+        self.use_camera_aware = use_camera_aware
+        
+        # 初始化深度损失模块
+        if use_depth_supervision and depth_loss_cfg is not None:
+            self.depth_loss = MODELS.build(depth_loss_cfg)
+        else:
+            self.depth_loss = None
+        
+        # 初始化Camera-Aware深度网络
+        if use_camera_aware:
+            if camera_aware_cfg is None:
+                camera_aware_cfg = dict(
+                    type='CameraAwareDepthNet',
+                    in_channels=in_channels + 64,  # 图像特征 + 深度特征
+                    mid_channels=in_channels + 64,
+                    depth_channels=self.D,
+                    context_channels=self.C,
+                    embed_dim=256,
+                )
+            
+            # 替换原来的depthnet为Camera-Aware版本
+            self.camera_aware_depthnet = MODELS.build(camera_aware_cfg)
+    
+    def get_cam_feats(self, x, d, camera_intrinsics=None, camera2lidar=None, img_aug_matrix=None):
+        """
+        获取融合深度信息和相机感知的特征
+        
+        Args:
+            x: 图像特征 [B, N, C, fH, fW]
+            d: 稀疏深度图 [B, N, 1, H, W]
+            camera_intrinsics: 相机内参 [B, N, 4, 4]
+            camera2lidar: 相机到LiDAR变换 [B, N, 4, 4]
+            img_aug_matrix: 图像增强矩阵 [B, N, 4, 4]
+            
+        Returns:
+            3D特征 [B, N, D, fH, fW, C]
+        """
+        B, N, C, fH, fW = x.shape
+        
+        # 展平batch和相机维度
+        d = d.view(B * N, *d.shape[2:])
+        x = x.view(B * N, C, fH, fW)
+        
+        # 编码稀疏深度图
+        d = self.dtransform(d)
+        
+        # 拼接深度特征和图像特征
+        x = torch.cat([d, x], dim=1)
+        
+        # 如果启用Camera-Aware
+        if self.use_camera_aware and camera_intrinsics is not None:
+            # 准备相机参数
+            intrinsics = camera_intrinsics[..., :3, :3].reshape(B * N, 3, 3)
+            
+            # 计算Camera-to-Ego变换
+            # camera2lidar是Camera-to-LiDAR，我们需要Camera-to-Ego
+            # 这里假设LiDAR坐标系就是Ego坐标系
+            cam2ego = camera2lidar.reshape(B * N, 4, 4)
+            
+            # IDA矩阵
+            ida_matrix = img_aug_matrix.reshape(B * N, 4, 4)
+            
+            # 使用Camera-Aware深度网络
+            depth_logits, context = self.camera_aware_depthnet(
+                x, intrinsics, cam2ego, ida_matrix
+            )
+            
+            # 应用softmax得到深度分布
+            depth = depth_logits.softmax(dim=1)
+            
+            # 外积操作
+            x = depth.unsqueeze(1) * context.unsqueeze(2)
+        else:
+            # 使用原始depthnet
+            x = self.depthnet(x)
+            
+            # 分离深度分布和语义特征
+            depth = x[:, :self.D].softmax(dim=1)
+            x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
+        
+        # 恢复维度
+        x = x.view(B, N, self.C, self.D, fH, fW)
+        x = x.permute(0, 1, 3, 4, 5, 2)
+        return x
+    
+    def forward(
+        self,
+        img,
+        points,
+        lidar2image,
+        cam_intrinsic,
+        camera2lidar,
+        img_aug_matrix,
+        lidar_aug_matrix,
+        metas,
+        depth_gt_indices=None,
+        depth_valid_mask=None,
+        **kwargs,
+    ):
+        """
+        前向传播
+        
+        Args:
+            img: 图像特征 [B, N, C, fH, fW]
+            points: LiDAR点云
+            lidar2image: LiDAR到图像投影矩阵
+            cam_intrinsic: 相机内参 [B, N, 4, 4]
+            camera2lidar: 相机到LiDAR变换 [B, N, 4, 4]
+            img_aug_matrix: 图像增强矩阵 [B, N, 4, 4]
+            lidar_aug_matrix: LiDAR增强矩阵 [B, 4, 4]
+            metas: 元信息
+            depth_gt_indices: 深度GT索引 [B, N, fH, fW]（可选）
+            depth_valid_mask: 有效掩码 [B, N, fH, fW]（可选）
+            
+        Returns:
+            训练时: (bev_feat, aux_dict) 如果提供了depth_gt
+            推理时: bev_feat
+        """
+        # 提取变换矩阵
+        intrins = cam_intrinsic[..., :3, :3]
+        post_rots = img_aug_matrix[..., :3, :3]
+        post_trans = img_aug_matrix[..., :3, 3]
+        camera2lidar_rots = camera2lidar[..., :3, :3]
+        camera2lidar_trans = camera2lidar[..., :3, 3]
+        
+        batch_size = len(points)
+        depth = torch.zeros(batch_size, img.shape[1], 1,
+                           *self.image_size).to(points[0].device)
+        
+        # 生成稀疏深度图（与父类相同的逻辑）
+        for b in range(batch_size):
+            cur_coords = points[b][:, :3]
+            cur_img_aug_matrix = img_aug_matrix[b]
+            cur_lidar_aug_matrix = lidar_aug_matrix[b]
+            cur_lidar2image = lidar2image[b]
+            
+            # 撤销LiDAR增强
+            cur_coords -= cur_lidar_aug_matrix[:3, 3]
+            cur_coords = torch.inverse(cur_lidar_aug_matrix[:3, :3]).matmul(
+                cur_coords.transpose(1, 0))
+            
+            # LiDAR -> 图像
+            cur_coords = cur_lidar2image[:, :3, :3].matmul(cur_coords)
+            cur_coords += cur_lidar2image[:, :3, 3].reshape(-1, 3, 1)
+            
+            # 透视除法
+            dist = cur_coords[:, 2, :]
+            cur_coords[:, 2, :] = torch.clamp(cur_coords[:, 2, :], 1e-5, 1e5)
+            cur_coords[:, :2, :] /= cur_coords[:, 2:3, :]
+            
+            # 应用图像增强
+            cur_coords = cur_img_aug_matrix[:, :3, :3].matmul(cur_coords)
+            cur_coords += cur_img_aug_matrix[:, :3, 3].reshape(-1, 3, 1)
+            cur_coords = cur_coords[:, :2, :].transpose(1, 2)
+            cur_coords = cur_coords[..., [1, 0]]
+            
+            # 过滤
+            on_img = ((cur_coords[..., 0] < self.image_size[0])
+                     & (cur_coords[..., 0] >= 0)
+                     & (cur_coords[..., 1] < self.image_size[1])
+                     & (cur_coords[..., 1] >= 0))
+            
+            for c in range(on_img.shape[0]):
+                masked_coords = cur_coords[c, on_img[c]].long()
+                masked_dist = dist[c, on_img[c]]
+                depth = depth.to(masked_dist.dtype)
+                depth[b, c, 0, masked_coords[:, 0],
+                      masked_coords[:, 1]] = masked_dist
+        
+        # 计算几何
+        extra_rots = lidar_aug_matrix[..., :3, :3]
+        extra_trans = lidar_aug_matrix[..., :3, 3]
+        
+        geom = self.get_geometry(
+            camera2lidar_rots,
+            camera2lidar_trans,
+            intrins,
+            post_rots,
+            post_trans,
+            extra_rots=extra_rots,
+            extra_trans=extra_trans,
+        )
+        
+        # 获取相机特征
+        x = self.get_cam_feats(
+            img, depth,
+            camera_intrinsics=cam_intrinsic if self.use_camera_aware else None,
+            camera2lidar=camera2lidar if self.use_camera_aware else None,
+            img_aug_matrix=img_aug_matrix if self.use_camera_aware else None,
+        )
+        
+        # BEV池化
+        bev_feat = self.bev_pool(geom, x)
+        bev_feat = self.downsample(bev_feat)
+        
+        # 如果是训练模式且提供了深度GT，返回辅助字典
+        if self.training and self.use_depth_supervision and depth_gt_indices is not None:
+            # 这里我们需要保存深度预测用于损失计算
+            # 但是get_cam_feats已经应用了softmax，我们需要logits
+            # 为了简化，我们在这里重新计算一次（仅用于训练）
+            
+            B, N, C, fH, fW = img.shape
+            d_flat = depth.view(B * N, *depth.shape[2:])
+            x_flat = img.view(B * N, C, fH, fW)
+            d_feat = self.dtransform(d_flat)
+            x_cat = torch.cat([d_feat, x_flat], dim=1)
+            
+            if self.use_camera_aware and cam_intrinsic is not None:
+                intrinsics_flat = cam_intrinsic[..., :3, :3].reshape(B * N, 3, 3)
+                cam2ego = camera2lidar.reshape(B * N, 4, 4)
+                ida_matrix_flat = img_aug_matrix.reshape(B * N, 4, 4)
+                depth_pred, _ = self.camera_aware_depthnet(
+                    x_cat, intrinsics_flat, cam2ego, ida_matrix_flat
+                )
+            else:
+                depth_pred = self.depthnet(x_cat)[:, :self.D]
+            
+            aux_dict = {
+                'depth_pred': depth_pred,
+                'depth_gt_indices': depth_gt_indices.reshape(B * N, fH, fW),
+                'valid_mask': depth_valid_mask.reshape(B * N, fH, fW),
+            }
+            return bev_feat, aux_dict
+        
+        return bev_feat

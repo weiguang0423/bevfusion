@@ -787,3 +787,218 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
         repr_str += f'close_radius={self.close_radius}, '
         repr_str += f'test_mode={self.test_mode})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class LoadDepthFromPoints(BaseTransform):
+    """
+    从LiDAR点云生成深度监督GT
+    
+    处理流程：
+    1. 将点云投影到各相机图像平面
+    2. 应用图像数据增强变换
+    3. 下采样到特征图尺度
+    4. Min Pooling处理重叠点
+    5. 形态学膨胀增加覆盖范围
+    6. 深度离散化为bin索引
+    
+    Args:
+        feature_size: 特征图尺寸 (fH, fW)
+        dbound: 深度范围 (min, max, interval)
+        discretization: 深度分桶策略 'uniform' 或 'sid'
+        dilation_kernel: 形态学膨胀核大小
+    """
+
+    def __init__(
+        self,
+        feature_size=(16, 44),
+        dbound=(1.0, 60.0, 0.5),
+        discretization='uniform',
+        dilation_kernel=3,
+    ):
+        self.feature_size = feature_size
+        self.dbound = dbound
+        self.discretization = discretization
+        self.dilation_kernel = dilation_kernel
+        
+        # 计算深度bin数量
+        self.D = int((dbound[1] - dbound[0]) / dbound[2])
+        
+        # 预计算深度bin边界
+        if discretization == 'uniform':
+            self.depth_bins = np.arange(dbound[0], dbound[1], dbound[2])
+        elif discretization == 'sid':
+            self.depth_bins = np.exp(
+                np.linspace(np.log(dbound[0]), np.log(dbound[1]), self.D)
+            )
+        else:
+            raise ValueError(f'Unknown discretization: {discretization}')
+
+    def _project_points_to_image(self, points, lidar2img, img_aug_matrix, img_shape):
+        """将LiDAR点云投影到图像平面并应用增强变换"""
+        pts_xyz = points[:, :3]
+        pts_homo = np.concatenate([pts_xyz, np.ones((pts_xyz.shape[0], 1))], axis=1)
+        
+        # 投影到原始图像坐标
+        img_coords = lidar2img @ pts_homo.T
+        depth = img_coords[2, :]
+        
+        # 过滤相机后方的点
+        valid_depth = depth > 0
+        
+        # 归一化得到原始像素坐标
+        u_orig = img_coords[0, :] / (depth + 1e-6)
+        v_orig = img_coords[1, :] / (depth + 1e-6)
+        
+        # 应用图像增强变换
+        uv_homo = np.stack([u_orig, v_orig, np.ones_like(u_orig)], axis=0)
+        aug_coords = img_aug_matrix[:3, :3] @ uv_homo + img_aug_matrix[:3, 3:4]
+        u_aug = aug_coords[0, :]
+        v_aug = aug_coords[1, :]
+        
+        # 过滤图像范围外的点
+        H, W = img_shape
+        valid_u = (u_aug >= 0) & (u_aug < W)
+        valid_v = (v_aug >= 0) & (v_aug < H)
+        valid_mask = valid_depth & valid_u & valid_v
+        
+        return u_aug[valid_mask], v_aug[valid_mask], depth[valid_mask]
+
+    def _downsample_to_feature_map(self, u, v, depth, img_shape):
+        """下采样到特征图尺度并执行Min Pooling"""
+        H, W = img_shape
+        fH, fW = self.feature_size
+        
+        stride_h = H / fH
+        stride_w = W / fW
+        
+        u_feat = (u / stride_w).astype(np.int32)
+        v_feat = (v / stride_h).astype(np.int32)
+        
+        u_feat = np.clip(u_feat, 0, fW - 1)
+        v_feat = np.clip(v_feat, 0, fH - 1)
+        
+        sparse_depth = np.full((fH, fW), np.inf, dtype=np.float32)
+        
+        for i in range(len(u_feat)):
+            v_idx = v_feat[i]
+            u_idx = u_feat[i]
+            d = depth[i]
+            if d < sparse_depth[v_idx, u_idx]:
+                sparse_depth[v_idx, u_idx] = d
+        
+        sparse_depth[sparse_depth == np.inf] = 0.0
+        return sparse_depth
+
+    def _apply_morphological_dilation(self, sparse_depth):
+        """应用形态学膨胀增加监督信号密度"""
+        if self.dilation_kernel <= 1:
+            return sparse_depth
+        
+        try:
+            import cv2
+            from scipy.ndimage import minimum_filter
+        except ImportError:
+            warnings.warn('OpenCV or scipy not found, skipping dilation')
+            return sparse_depth
+        
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (self.dilation_kernel, self.dilation_kernel)
+        )
+        
+        mask = (sparse_depth > 0).astype(np.uint8)
+        dilated_mask = cv2.dilate(mask, kernel, iterations=1)
+        
+        dilated_depth = sparse_depth.copy()
+        new_valid = (dilated_mask > 0) & (mask == 0)
+        
+        if np.any(new_valid):
+            depth_for_filter = sparse_depth.copy()
+            depth_for_filter[depth_for_filter == 0] = np.inf
+            filtered_depth = minimum_filter(depth_for_filter, size=self.dilation_kernel)
+            dilated_depth[new_valid] = filtered_depth[new_valid]
+        
+        return dilated_depth
+
+    def _discretize_depth(self, sparse_depth):
+        """将连续深度值离散化为bin索引"""
+        valid_mask = (sparse_depth > 0) & \
+                     (sparse_depth >= self.dbound[0]) & \
+                     (sparse_depth <= self.dbound[1])
+        
+        depth_indices = np.full(sparse_depth.shape, -1, dtype=np.int64)
+        
+        if not np.any(valid_mask):
+            return depth_indices, valid_mask
+        
+        valid_depths = sparse_depth[valid_mask]
+        bin_indices = np.searchsorted(self.depth_bins, valid_depths, side='right') - 1
+        bin_indices = np.clip(bin_indices, 0, self.D - 1)
+        depth_indices[valid_mask] = bin_indices
+        
+        return depth_indices, valid_mask
+
+    def transform(self, results):
+        """生成深度GT并添加到results字典"""
+        if 'points' not in results or 'lidar2img' not in results:
+            warnings.warn('points or lidar2img not found, skipping depth GT')
+            return results
+        
+        points = results['points'].tensor.numpy()
+        
+        # 使用原始的lidar2img
+        if 'ori_lidar2img' in results:
+            lidar2img = results['ori_lidar2img']
+        else:
+            lidar2img = results['lidar2img']
+        
+        # 获取增强后的图像尺寸
+        if 'img' in results and isinstance(results['img'], list) and len(results['img']) > 0:
+            first_img = results['img'][0]
+            if isinstance(first_img, np.ndarray):
+                img_shape = first_img.shape[:2]
+            else:
+                img_shape = (256, 704)
+        else:
+            img_shape = (256, 704)
+        
+        # 获取图像增强矩阵
+        if 'img_aug_matrix' in results:
+            img_aug_matrix = results['img_aug_matrix']
+            if isinstance(img_aug_matrix, list):
+                img_aug_matrix = np.stack(img_aug_matrix, axis=0)
+        else:
+            N_cams = lidar2img.shape[0]
+            img_aug_matrix = np.tile(np.eye(4), (N_cams, 1, 1))
+        
+        N_cams = lidar2img.shape[0]
+        fH, fW = self.feature_size
+        
+        all_depth_indices = []
+        all_valid_masks = []
+        
+        for cam_idx in range(N_cams):
+            u, v, depth = self._project_points_to_image(
+                points, lidar2img[cam_idx], img_aug_matrix[cam_idx], img_shape
+            )
+            
+            sparse_depth = self._downsample_to_feature_map(u, v, depth, img_shape)
+            dilated_depth = self._apply_morphological_dilation(sparse_depth)
+            depth_indices, valid_mask = self._discretize_depth(dilated_depth)
+            
+            all_depth_indices.append(depth_indices)
+            all_valid_masks.append(valid_mask)
+        
+        results['depth_gt_indices'] = np.stack(all_depth_indices, axis=0)
+        results['depth_valid_mask'] = np.stack(all_valid_masks, axis=0)
+        
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__ + '('
+        repr_str += f'feature_size={self.feature_size}, '
+        repr_str += f'dbound={self.dbound}, '
+        repr_str += f'discretization={self.discretization}, '
+        repr_str += f'dilation_kernel={self.dilation_kernel})'
+        return repr_str

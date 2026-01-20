@@ -24,7 +24,7 @@ Transformers (CVPR 2022)
 modify from https://github.com/mit-han-lab/bevfusion
 """
 import copy
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -104,6 +104,130 @@ class ConvFuser(nn.Sequential):
             融合后的特征
         """
         return super().forward(torch.cat(inputs, dim=1))
+
+
+@MODELS.register_module()
+class SEConvFuser(nn.Module):
+    """
+    带通道注意力的卷积融合器
+    
+    针对三模态融合（LiDAR 256ch + Camera 80ch + Radar 64ch）优化，
+    在融合前对每个模态分支应用SE注意力，防止弱模态（如Radar）被淹没。
+    
+    融合策略：
+    1. 对每个模态分支独立应用SE注意力
+    2. 拼接所有模态特征
+    3. 3x3卷积融合 -> BN -> ReLU
+    
+    Args:
+        in_channels (list[int]): 输入特征通道数列表，如 [80, 256, 64]
+        out_channels (int): 输出特征通道数
+        reduction (int): SE模块的通道压缩比，默认4
+        use_se (list[bool] | bool): 是否对每个模态使用SE，默认True
+    """
+
+    def __init__(
+        self,
+        in_channels: List[int],
+        out_channels: int,
+        reduction: int = 4,
+        use_se: Union[List[bool], bool] = True
+    ) -> None:
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # 处理use_se参数
+        if isinstance(use_se, bool):
+            use_se = [use_se] * len(in_channels)
+        self.use_se = use_se
+        
+        # 为每个模态创建SE模块
+        self.se_modules = nn.ModuleList()
+        for i, (ch, apply_se) in enumerate(zip(in_channels, use_se)):
+            if apply_se:
+                self.se_modules.append(SEBlock(ch, reduction))
+            else:
+                self.se_modules.append(nn.Identity())
+        
+        # 融合卷积
+        self.conv = nn.Conv2d(
+            sum(in_channels), out_channels, 3, padding=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        """
+        融合多个输入特征
+        
+        Args:
+            inputs: 输入特征列表 [img_bev, lidar_bev, radar_bev]
+            
+        Returns:
+            融合后的特征
+        """
+        # 对每个模态应用SE注意力
+        attended_inputs = []
+        for feat, se_module in zip(inputs, self.se_modules):
+            attended_inputs.append(se_module(feat))
+        
+        # 拼接并融合
+        x = torch.cat(attended_inputs, dim=1)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation 通道注意力模块
+    
+    通过全局平均池化捕获通道间依赖关系，
+    让网络自主学习每个通道的重要性权重。
+    
+    流程：
+    1. Squeeze: 全局平均池化 -> [B, C, 1, 1]
+    2. Excitation: FC -> ReLU -> FC -> Sigmoid -> [B, C, 1, 1]
+    3. Scale: 输入特征 * 通道权重
+    
+    Args:
+        channels (int): 输入通道数
+        reduction (int): 中间层通道压缩比，默认4
+    """
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        
+        reduced_channels = max(channels // reduction, 8)
+        
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, reduced_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_channels, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: 输入特征 [B, C, H, W]
+            
+        Returns:
+            通道加权后的特征 [B, C, H, W]
+        """
+        B, C, _, _ = x.shape
+        
+        # Squeeze: [B, C, H, W] -> [B, C]
+        y = self.squeeze(x).view(B, C)
+        
+        # Excitation: [B, C] -> [B, C]
+        y = self.excitation(y).view(B, C, 1, 1)
+        
+        # Scale
+        return x * y
 
 
 @MODELS.register_module()
@@ -277,6 +401,68 @@ class TransFusionHead(nn.Module):
 
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
+        
+        # 雷达速度BEV图（由模型设置）
+        self._radar_velocity_bev = None
+        
+        # 雷达速度融合权重（可学习）
+        self.use_radar_velocity = False  # 默认关闭，需要在配置中启用
+    
+    def set_radar_velocity_bev(self, radar_velocity_bev):
+        """
+        设置雷达速度BEV图
+        
+        由 BEVFusionWithRadar 模型在 predict/loss 时调用。
+        
+        Args:
+            radar_velocity_bev: 雷达速度BEV图 [B, 3, H, W]
+        """
+        self._radar_velocity_bev = radar_velocity_bev
+        if radar_velocity_bev is not None:
+            self.use_radar_velocity = True
+    
+    def fuse_radar_velocity(self, pred_vel, query_pos):
+        """
+        融合雷达速度和预测速度
+        
+        从雷达速度BEV图中采样对应位置的速度，
+        基于置信度进行加权融合。
+        
+        Args:
+            pred_vel: 网络预测的速度 [B, 2, num_proposals]
+            query_pos: query位置 [B, num_proposals, 2]
+        
+        Returns:
+            fused_vel: 融合后的速度 [B, 2, num_proposals]
+        """
+        if self._radar_velocity_bev is None:
+            return pred_vel
+        
+        B, _, num_proposals = pred_vel.shape
+        H, W = self._radar_velocity_bev.shape[2:]
+        
+        # 将 query_pos 归一化到 [-1, 1] 用于 grid_sample
+        grid = query_pos.clone()
+        grid[..., 0] = (grid[..., 0] / W) * 2 - 1
+        grid[..., 1] = (grid[..., 1] / H) * 2 - 1
+        grid = grid.unsqueeze(2)  # [B, num_proposals, 1, 2]
+        
+        # 从雷达速度BEV图中采样
+        sampled = F.grid_sample(
+            self._radar_velocity_bev, grid, 
+            mode='bilinear', align_corners=False, padding_mode='zeros'
+        )  # [B, 3, num_proposals, 1]
+        sampled = sampled.squeeze(-1)  # [B, 3, num_proposals]
+        
+        # 提取速度和置信度
+        radar_vel = sampled[:, :2]  # [B, 2, num_proposals]
+        radar_conf = sampled[:, 2:3]  # [B, 1, num_proposals]
+        
+        # 基于置信度的加权融合
+        # 置信度高的位置更信任雷达速度
+        fused_vel = radar_conf * radar_vel + (1 - radar_conf) * pred_vel
+        
+        return fused_vel
 
     def create_2D_grid(self, x_size, y_size):
         """
@@ -457,6 +643,16 @@ class TransFusionHead(nn.Module):
             # 中心位置 = 预测偏移 + query位置
             res_layer['center'] = res_layer['center'] + query_pos.permute(
                 0, 2, 1)
+            
+            # ============ 雷达速度融合（新增）============
+            # 如果有雷达速度BEV图，融合雷达速度和预测速度
+            if self.use_radar_velocity and 'vel' in res_layer:
+                # 使用当前预测的中心位置查询雷达速度
+                current_center = res_layer['center'].permute(0, 2, 1)  # [B, num_proposals, 2]
+                res_layer['vel'] = self.fuse_radar_velocity(
+                    res_layer['vel'], current_center
+                )
+            
             ret_dicts.append(res_layer)
 
             # 更新下一层的位置编码
@@ -1224,6 +1420,25 @@ class TransFusionHead(nn.Module):
             loss_dict[f'{prefix}_loss_cls'] = layer_loss_cls
             loss_dict[f'{prefix}_loss_bbox'] = layer_loss_bbox
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
+            
+            # ============ 单独计算速度损失 (仅用于TensorBoard监控，不参与梯度) ============
+            # 速度维度在code中的索引: [cx, cy, cz, w, l, h, sin, cos, vx, vy]
+            # 即索引 8 和 9
+            if 'vel' in preds_dict.keys() and preds.shape[-1] >= 10:
+                with torch.no_grad():
+                    # 提取速度预测和目标 (最后两个维度)
+                    vel_preds = preds[..., 8:10].detach()  # [BS, num_proposals, 2]
+                    vel_targets = layer_bbox_targets[..., 8:10]  # [BS, num_proposals, 2]
+                    vel_weights = layer_reg_weights[..., 8:10]  # [BS, num_proposals, 2]
+                    
+                    # 计算速度损失 (仅监控，已包含在loss_bbox中)
+                    layer_loss_vel = self.loss_bbox(
+                        vel_preds,
+                        vel_targets,
+                        vel_weights,
+                        avg_factor=max(num_pos, 1))
+                    
+                    loss_dict[f'{prefix}_loss_vel'] = layer_loss_vel.detach()
 
         # 记录匹配的IoU
         loss_dict['matched_ious'] = layer_loss_cls.new_tensor(matched_ious)

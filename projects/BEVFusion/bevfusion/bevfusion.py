@@ -225,7 +225,9 @@ class BEVFusion(Base3DDetector):
         img_aug_matrix,
         lidar_aug_matrix,
         img_metas,
-    ) -> torch.Tensor:
+        depth_gt_indices=None,
+        depth_valid_mask=None,
+    ):
         """
         提取图像特征并转换到BEV空间
         
@@ -244,9 +246,12 @@ class BEVFusion(Base3DDetector):
             img_aug_matrix: 图像数据增强矩阵
             lidar_aug_matrix: LiDAR数据增强矩阵
             img_metas: 图像元信息
+            depth_gt_indices: 深度GT索引 [B, N, fH, fW]（可选，训练时使用）
+            depth_valid_mask: 有效掩码 [B, N, fH, fW]（可选，训练时使用）
             
         Returns:
-            torch.Tensor: BEV空间的图像特征，形状为 [B, C, H_bev, W_bev]
+            训练时（如果提供了depth_gt）: (bev_feat, aux_dict)
+            推理时: bev_feat
         """
         # 获取输入维度: B=batch, N=相机数, C=通道, H=高, W=宽
         B, N, C, H, W = x.size()
@@ -269,7 +274,7 @@ class BEVFusion(Base3DDetector):
         # 视角变换：将2D图像特征投影到3D BEV空间
         # 使用float32精度以保证数值稳定性（深度估计对精度敏感）
         with torch.autocast(device_type='cuda', dtype=torch.float32):
-            x = self.view_transform(
+            result = self.view_transform(
                 x,
                 points,
                 lidar2image,
@@ -278,8 +283,10 @@ class BEVFusion(Base3DDetector):
                 img_aug_matrix,
                 lidar_aug_matrix,
                 img_metas,
+                depth_gt_indices=depth_gt_indices,
+                depth_valid_mask=depth_valid_mask,
             )
-        return x
+        return result
 
     def extract_pts_feat(self, batch_inputs_dict) -> torch.Tensor:
         """
@@ -402,7 +409,13 @@ class BEVFusion(Base3DDetector):
         # 提取元信息（如相机参数、图像尺寸等）
         batch_input_metas = [item.metainfo for item in batch_data_samples]
         # 提取并融合多模态特征
-        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        result = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        
+        # 处理返回值：推理时应该只返回feats，但为了兼容性处理tuple情况
+        if isinstance(result, tuple):
+            feats = result[0]
+        else:
+            feats = result
 
         # 通过检测头进行预测
         if self.with_bbox_head:
@@ -435,11 +448,13 @@ class BEVFusion(Base3DDetector):
             batch_input_metas: 元信息列表，包含相机参数等
         
         Returns:
-            融合后的BEV特征，用于检测头
+            训练时（如果有深度GT）: (融合后的BEV特征, aux_dict)
+            推理时: 融合后的BEV特征
         """
         imgs = batch_inputs_dict.get('imgs', None)
         points = batch_inputs_dict.get('points', None)
         features = []
+        aux_dict = None
         
         # ============ 图像分支处理 ============
         if imgs is not None:
@@ -468,13 +483,28 @@ class BEVFusion(Base3DDetector):
             img_aug_matrix = imgs.new_tensor(np.asarray(img_aug_matrix))
             lidar_aug_matrix = imgs.new_tensor(np.asarray(lidar_aug_matrix))
             
+            # 获取深度GT（如果存在）
+            depth_gt_indices = batch_inputs_dict.get('depth_gt_indices', None)
+            depth_valid_mask = batch_inputs_dict.get('depth_valid_mask', None)
+            
             # 提取图像BEV特征
             # 使用 deepcopy(points) 避免修改原始点云数据
-            img_feature = self.extract_img_feat(imgs, deepcopy(points),
-                                                lidar2image, camera_intrinsics,
-                                                camera2lidar, img_aug_matrix,
-                                                lidar_aug_matrix,
-                                                batch_input_metas)
+            img_result = self.extract_img_feat(
+                imgs, deepcopy(points),
+                lidar2image, camera_intrinsics,
+                camera2lidar, img_aug_matrix,
+                lidar_aug_matrix,
+                batch_input_metas,
+                depth_gt_indices=depth_gt_indices,
+                depth_valid_mask=depth_valid_mask,
+            )
+            
+            # 处理返回值：可能是 (bev_feat, aux_dict) 或 bev_feat
+            if isinstance(img_result, tuple):
+                img_feature, aux_dict = img_result
+            else:
+                img_feature = img_result
+            
             features.append(img_feature)
         
         # ============ 点云分支处理 ============
@@ -497,6 +527,9 @@ class BEVFusion(Base3DDetector):
         # 通过BEV Neck进行多尺度特征融合
         x = self.pts_neck(x)
 
+        # 如果有辅助字典，返回元组
+        if aux_dict is not None:
+            return x, aux_dict
         return x
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
@@ -508,11 +541,14 @@ class BEVFusion(Base3DDetector):
         完整的训练流程：
         1. 提取多模态特征并融合
         2. 通过检测头计算损失
+        3. 如果启用深度监督，计算深度监督损失
         
         Args:
             batch_inputs_dict (dict): 模型输入字典，包含：
                 - 'points': 点云数据列表
                 - 'imgs': 多视角图像（可选）
+                - 'depth_gt_indices': 深度GT索引（可选）
+                - 'depth_valid_mask': 有效掩码（可选）
             batch_data_samples (List[Det3DDataSample]): 数据样本列表，
                 包含 gt_instance_3d 等标注信息用于计算损失
         
@@ -521,20 +557,40 @@ class BEVFusion(Base3DDetector):
                 - 'loss_cls': 分类损失
                 - 'loss_bbox': 边界框回归损失
                 - 'loss_heatmap': 热力图损失（如果使用 CenterHead）
+                - 'loss_depth': 深度监督损失（如果启用深度监督）
                 - 其他检测头特定的损失项
         """
         # 提取元信息
         batch_input_metas = [item.metainfo for item in batch_data_samples]
         # 提取并融合多模态特征
-        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        result = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        
+        # 处理返回值：可能是 (feats, aux_dict) 或 feats
+        if isinstance(result, tuple):
+            feats, aux_dict = result
+        else:
+            feats = result
+            aux_dict = None
 
         losses = dict()
         # 通过检测头计算损失
         if self.with_bbox_head:
             bbox_loss = self.bbox_head.loss(feats, batch_data_samples)
-
-        # 更新损失字典
-        losses.update(bbox_loss)
+            losses.update(bbox_loss)
+        
+        # 计算深度监督损失
+        if aux_dict is not None and hasattr(self.view_transform, 'depth_loss'):
+            depth_loss_module = self.view_transform.depth_loss
+            if depth_loss_module is not None:
+                depth_pred = aux_dict['depth_pred']
+                depth_gt_indices = aux_dict['depth_gt_indices']
+                valid_mask = aux_dict['valid_mask']
+                
+                # 计算深度损失
+                loss_depth = depth_loss_module(
+                    depth_pred, depth_gt_indices, valid_mask
+                )
+                losses['loss_depth'] = loss_depth
 
         return losses
 
@@ -553,13 +609,15 @@ class BEVFusionWithRadar(BEVFusion):
     1. 图像分支: imgs -> img_backbone -> img_neck -> view_transform -> img_bev_feat
     2. 点云分支: points -> voxelize -> pts_voxel_encoder -> pts_middle_encoder -> pts_bev_feat
     3. 雷达分支: radar_points -> radar_voxelize -> radar_voxel_encoder -> radar_middle_encoder -> radar_bev_feat
-    4. 融合: [img_bev_feat, pts_bev_feat, radar_bev_feat] -> fusion_layer -> fused_bev_feat
-    5. 检测: fused_bev_feat -> pts_backbone -> pts_neck -> bbox_head -> predictions
+    4. 雷达速度分支: radar_points -> radar_velocity_bev (直接编码多普勒速度)
+    5. 融合: [img_bev_feat, pts_bev_feat, radar_bev_feat] -> fusion_layer -> fused_bev_feat
+    6. 检测: fused_bev_feat + radar_velocity_bev -> bbox_head -> predictions
     
     雷达分支组件：
     - radar_voxel_layer: 雷达点云体素化层 (复用Voxelization)
     - radar_voxel_encoder: 雷达体素特征编码器 (复用PillarFeatureNet)
     - radar_middle_encoder: 雷达中间编码器 (复用PointPillarsScatter)
+    - radar_velocity_encoder: 雷达速度BEV编码器 (直接编码多普勒速度)
     
     Args:
         radar_voxel_encoder (dict, optional): 雷达体素编码器配置
@@ -567,6 +625,9 @@ class BEVFusionWithRadar(BEVFusion):
             Defaults to None.
         radar_middle_encoder (dict, optional): 雷达中间编码器配置
             Configuration for radar middle encoder (PointPillarsScatter).
+            Defaults to None.
+        radar_velocity_encoder (dict, optional): 雷达速度BEV编码器配置
+            Configuration for radar velocity BEV encoder.
             Defaults to None.
         其他参数同BEVFusion
     
@@ -580,6 +641,8 @@ class BEVFusionWithRadar(BEVFusion):
         self,
         radar_voxel_encoder: Optional[dict] = None,
         radar_middle_encoder: Optional[dict] = None,
+        radar_velocity_encoder: Optional[dict] = None,
+        velocity_refinement: Optional[dict] = None,
         **kwargs,
     ) -> None:
         """
@@ -591,10 +654,14 @@ class BEVFusionWithRadar(BEVFusion):
         1. 从data_preprocessor中提取雷达体素化配置（如果存在）
         2. 调用父类初始化（构建图像和点云分支）
         3. 构建雷达处理分支（体素化层 + 体素编码器 + 中间编码器）
+        4. 构建雷达速度BEV编码器（直接编码多普勒速度）
+        5. 构建速度校准模块（基于置信度的加权融合）
         
         Args:
             radar_voxel_encoder (dict, optional): 雷达体素编码器配置
             radar_middle_encoder (dict, optional): 雷达中间编码器配置
+            radar_velocity_encoder (dict, optional): 雷达速度BEV编码器配置
+            velocity_refinement (dict, optional): 速度校准模块配置
             **kwargs: 传递给父类BEVFusion的其他参数
         """
         # 从data_preprocessor中提取雷达体素化配置
@@ -611,6 +678,8 @@ class BEVFusionWithRadar(BEVFusion):
         self.radar_voxel_encoder = None
         self.radar_middle_encoder = None
         self.radar_voxel_layer = None
+        self.radar_velocity_encoder = None
+        self.velocity_refinement = None
         
         # 只有当配置了雷达编码器时才构建雷达分支
         if radar_voxel_encoder is not None and radar_middle_encoder is not None:
@@ -634,6 +703,14 @@ class BEVFusionWithRadar(BEVFusion):
             
             # 构建雷达中间编码器 (PointPillarsScatter)
             self.radar_middle_encoder = MODELS.build(radar_middle_encoder)
+        
+        # 构建雷达速度BEV编码器（可选，用于直接利用多普勒速度）
+        if radar_velocity_encoder is not None:
+            self.radar_velocity_encoder = MODELS.build(radar_velocity_encoder)
+        
+        # 构建速度校准模块（可选，用于基于置信度的速度融合）
+        if velocity_refinement is not None:
+            self.velocity_refinement = MODELS.build(velocity_refinement)
     
     @property
     def with_radar(self) -> bool:
@@ -641,6 +718,54 @@ class BEVFusionWithRadar(BEVFusion):
         return (self.radar_voxel_encoder is not None and 
                 self.radar_middle_encoder is not None and
                 self.radar_voxel_layer is not None)
+    
+    @property
+    def with_radar_velocity(self) -> bool:
+        """bool: 检测器是否有雷达速度BEV编码器"""
+        return self.radar_velocity_encoder is not None
+    
+    @property
+    def with_velocity_refinement(self) -> bool:
+        """bool: 检测器是否有速度校准模块"""
+        return self.velocity_refinement is not None
+    
+    def extract_radar_velocity_bev(self, batch_inputs_dict: Dict) -> Optional[Tensor]:
+        """
+        提取雷达速度BEV图
+        
+        直接将雷达点云的多普勒速度编码为BEV速度图，
+        供检测头直接查询使用。
+        
+        Args:
+            batch_inputs_dict (dict): 包含雷达点云的输入字典
+        
+        Returns:
+            Tensor or None: 雷达速度BEV图 [B, 3, H, W]
+                - [:, 0:2, :, :]: vx, vy 速度分量
+                - [:, 2, :, :]: 置信度
+        """
+        if not self.with_radar_velocity:
+            return None
+        
+        radar_points = batch_inputs_dict.get('radar_points', None)
+        
+        # 获取 batch_size
+        if 'points' in batch_inputs_dict:
+            batch_size = len(batch_inputs_dict['points'])
+        elif 'imgs' in batch_inputs_dict:
+            batch_size = batch_inputs_dict['imgs'].shape[0]
+        else:
+            batch_size = 1
+        
+        if radar_points is None or len(radar_points) == 0:
+            # 返回零填充的速度BEV图
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            return torch.zeros(
+                batch_size, 3, 180, 180,  # 默认 BEV 尺寸
+                dtype=torch.float32, device=device
+            )
+        
+        return self.radar_velocity_encoder(radar_points, batch_size)
     
     @torch.no_grad()
     def radar_voxelize(self, radar_points: List[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
@@ -867,6 +992,13 @@ class BEVFusionWithRadar(BEVFusion):
             # 即使雷达特征为空（零填充），也要添加到features中
             # 这样融合层的输入通道数才能匹配
             features.append(radar_feature)
+        
+        # ============ 雷达速度BEV图（新增）============
+        # 直接编码雷达多普勒速度，供检测头查询
+        if self.with_radar_velocity:
+            self._radar_velocity_bev = self.extract_radar_velocity_bev(batch_inputs_dict)
+        else:
+            self._radar_velocity_bev = None
 
         # ============ 多模态特征融合 ============
         if self.fusion_layer is not None:
@@ -880,3 +1012,54 @@ class BEVFusionWithRadar(BEVFusion):
         x = self.pts_neck(x)
 
         return x
+    
+    def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
+                batch_data_samples: List[Det3DDataSample],
+                **kwargs) -> List[Det3DDataSample]:
+        """
+        推理/测试阶段的前向传播（重写父类方法）
+        
+        Args:
+            batch_inputs_dict (dict): 模型输入字典
+            batch_data_samples (List[Det3DDataSample]): 数据样本列表
+
+        Returns:
+            list[Det3DDataSample]: 检测结果列表
+        """
+        batch_input_metas = [item.metainfo for item in batch_data_samples]
+        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+
+        if self.with_bbox_head:
+            # 传递雷达速度BEV图给检测头
+            if hasattr(self.bbox_head, 'set_radar_velocity_bev'):
+                self.bbox_head.set_radar_velocity_bev(self._radar_velocity_bev)
+            outputs = self.bbox_head.predict(feats, batch_input_metas)
+
+        res = self.add_pred_to_datasample(batch_data_samples, outputs)
+        return res
+    
+    def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
+             batch_data_samples: List[Det3DDataSample],
+             **kwargs) -> List[Det3DDataSample]:
+        """
+        训练阶段的损失计算（重写父类方法）
+        
+        Args:
+            batch_inputs_dict (dict): 模型输入字典
+            batch_data_samples (List[Det3DDataSample]): 数据样本列表
+        
+        Returns:
+            dict: 损失字典
+        """
+        batch_input_metas = [item.metainfo for item in batch_data_samples]
+        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+
+        losses = dict()
+        if self.with_bbox_head:
+            # 传递雷达速度BEV图给检测头
+            if hasattr(self.bbox_head, 'set_radar_velocity_bev'):
+                self.bbox_head.set_radar_velocity_bev(self._radar_velocity_bev)
+            bbox_loss = self.bbox_head.loss(feats, batch_data_samples)
+
+        losses.update(bbox_loss)
+        return losses

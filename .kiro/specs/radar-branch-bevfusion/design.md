@@ -1,567 +1,247 @@
-# Design Document: BEVFusion Radar Branch
+# 设计文档：几何感知型多路径雷达融合架构
 
-## Overview
+## 概述
 
-本设计文档描述了在BEVFusion框架中添加毫米波雷达分支的技术方案。该方案遵循BEVFusion的设计理念，将雷达点云数据转换到统一的BEV空间，与图像和激光雷达特征进行融合。
+本设计文档描述了在BEVFusion框架中重新设计毫米波雷达分支的技术方案。该方案基于**几何感知型多路径雷达融合架构**，核心理念是：
+
+1. **几何感知 (Geometry-Awareness)**：通过引入方位角特征（sin θ, cos θ），使模型能够理解径向速度的物理置信度
+2. **任务解耦 (Task Decoupling)**：
+   - **语义特征路径**负责"物体在哪里"（分类与定位）
+   - **物理速度路径**负责"物体开多快"（运动估计）
 
 ### 设计目标
 
-1. **模块化设计**: 雷达分支作为独立模块，可灵活启用/禁用
-2. **代码复用**: 最大程度复用mmdetection3d现有模块
-3. **兼容性**: 完全兼容nuScenes数据集格式
-4. **一致性**: 与现有图像和激光雷达分支保持架构一致
+1. **几何增强**：将6维雷达点云扩展为10维，引入方位角和速度不确定度特征
+2. **双路径解耦**：语义路径用于融合，速度路径直连检测头
+3. **代码复用**：最大程度复用mmdetection3d现有模块
+4. **向后兼容**：不配置雷达分支时与原BEVFusion行为一致
 
 ### 数据流概览
 
 ```
-雷达点云 -> 数据加载 -> 预处理/增强 -> 体素化 -> Pillar编码 -> BEV特征
-                                                              ↓
-图像 -> 骨干网络 -> Neck -> 视角变换 -> BEV特征 ─────────────→ 融合层 -> 检测头
-                                                              ↑
-激光雷达 -> 体素化 -> 稀疏卷积 -> BEV特征 ─────────────────────┘
+[原始雷达18维] --> [几何增强: 引入 sinθ/cosθ/RMS] --> [10维增强点云]
+                                                          |
+                            +-----------------------------+-----------------------------+
+                            |                                                           |
+                            v                                                           v
+                  [路径A：语义特征路径]                                      [路径B：物理速度路径]
+                  (体素化 -> PillarNet -> Scatter)                        (MLP -> VelocityBEVEncoder)
+                            |                                                           |
+                            v                                                           |
+[Lidar/Image] --> [多模态语义融合 ConvFuser]                                             |
+                            |                                                           |
+                            v                                                           v
+                  [检测头 TransFusionHead] <---(速度查询与几何校验)--- [物理速度图4ch]
+                            |
+                            v
+                  [最终结果：位置、类别、高精度速度、航向角]
 ```
 
-## Architecture
+## 架构设计
 
 ### 整体架构
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           BEVFusion Model                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐         │
-│  │   Image Branch  │  │  LiDAR Branch   │  │  Radar Branch   │         │
-│  │                 │  │                 │  │   (NEW)         │         │
-│  │  img_backbone   │  │ pts_voxel_layer │  │ radar_voxel_layer│        │
-│  │  img_neck       │  │ pts_voxel_enc   │  │ radar_pillar_enc │        │
-│  │  view_transform │  │ pts_middle_enc  │  │ radar_scatter    │        │
-│  │       ↓         │  │       ↓         │  │       ↓         │         │
-│  │  img_bev_feat   │  │  pts_bev_feat   │  │ radar_bev_feat  │         │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘         │
-│           │                    │                    │                   │
-│           └────────────────────┼────────────────────┘                   │
-│                                ↓                                        │
-│                    ┌───────────────────────┐                           │
-│                    │     Fusion Layer      │                           │
-│                    │  (ConvFuser Extended) │                           │
-│                    └───────────┬───────────┘                           │
-│                                ↓                                        │
-│                    ┌───────────────────────┐                           │
-│                    │    pts_backbone       │                           │
-│                    │    pts_neck           │                           │
-│                    │    bbox_head          │                           │
-│                    └───────────────────────┘                           │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+雷达分支采用双路径设计：
+- **路径A（语义特征路径）**：体素化 -> PillarFeatureNet -> PointPillarsScatter -> 64通道BEV特征
+- **路径B（物理速度路径）**：MLP融合 -> BEV投影 -> 4通道速度图
 
-### 雷达分支详细架构
+两条路径并行处理，语义特征参与多模态融合，速度图直接供检测头查询。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Radar Branch                                │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  radar_points [N, 6]                                            │
-│  (x, y, z, rcs, vx_comp, vy_comp)                               │
-│         │                                                        │
-│         ↓                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │         Radar Voxelization              │                    │
-│  │  (reuse: Voxelization from mmdet3d)     │                    │
-│  │  voxel_size: [0.5, 0.5, 8.0]           │                    │
-│  │  point_cloud_range: [-54, -54, -5,      │                    │
-│  │                       54, 54, 3]        │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         ↓                                                        │
-│  voxels [M, max_points, 6], coords [M, 3], num_points [M]       │
-│         │                                                        │
-│         ↓                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │      Radar Pillar Feature Net           │                    │
-│  │  (reuse: PillarFeatureNet from mmdet3d) │                    │
-│  │  in_channels: 6                         │                    │
-│  │  feat_channels: [64]                    │                    │
-│  │  with_distance: False                   │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         ↓                                                        │
-│  pillar_features [M, 64]                                        │
-│         │                                                        │
-│         ↓                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │         Point Pillars Scatter           │                    │
-│  │  (reuse: PointPillarsScatter)           │                    │
-│  │  output_shape: [216, 216]               │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         ↓                                                        │
-│  radar_bev_feat [B, 64, 216, 216]                               │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+### 雷达分支详细设计
 
-## Components and Interfaces
+#### 几何增强层
 
-### 1. LoadRadarPointsFromFile (数据加载模块)
+输入：原始雷达点云 [N, 18]（nuScenes格式）
+输出：增强点云 [N, 10]
+
+增强过程：
+1. 提取核心特征：x, y, z, rcs, vx_comp, vy_comp
+2. 计算方位角：norm = sqrt(x² + y²), sin_θ = y/norm, cos_θ = x/norm
+3. 提取速度不确定度：vx_rms, vy_rms
+4. 组合输出：[x, y, z, rcs, vx_comp, vy_comp, sin_θ, cos_θ, vx_rms, vy_rms]
+
+#### 语义特征路径
+
+- 体素化：voxel_size = [0.6, 0.6, 8.0]
+- PillarFeatureNet：in_channels=10, feat_channels=[64]
+- PointPillarsScatter：output_shape=[180, 180]
+- 输出：radar_bev_feat [B, 64, H, W]
+
+#### 物理速度路径
+
+- MLP：6 -> 32 -> 16 -> 4
+- 输入：[vx_comp, vy_comp, sin_θ, cos_θ, vx_rms, vy_rms]
+- BEV投影：scatter_add聚合
+- 输出：velocity_bev [B, 4, H, W]（vx, vy, rms, confidence）
+
+## 组件与接口
+
+### 1. RadarGeometryEnhancer
 
 ```python
 @TRANSFORMS.register_module()
-class LoadRadarPointsFromFile(BaseTransform):
+class RadarGeometryEnhancer(BaseTransform):
     """
-    从文件加载雷达点云数据
-    
-    nuScenes雷达点云格式 (18维):
-    - x, y, z: 3D坐标
-    - dyn_prop: 动态属性
-    - id: 点ID
-    - rcs: 雷达散射截面
-    - vx, vy: 速度分量
-    - vx_comp, vy_comp: 补偿后的速度分量
-    - is_quality_valid: 质量标志
-    - ambig_state: 模糊状态
-    - x_rms, y_rms: 位置误差
-    - invalid_state: 无效状态
-    - pdh0: 检测概率
-    - vx_rms, vy_rms: 速度误差
+    雷达点云几何增强预处理
     
     Args:
-        coord_type (str): 坐标类型，默认'LIDAR'
-        load_dim (int): 加载的特征维度，默认18
-        use_dim (list[int]): 使用的特征维度索引，默认[0,1,2,5,8,9]
-            对应 x, y, z, rcs, vx_comp, vy_comp
-        backend_args (dict): 文件后端参数
+        eps (float): 避免除零的小量，默认1e-6
     """
-    
-    def __init__(
-        self,
-        coord_type: str = 'LIDAR',
-        load_dim: int = 18,
-        use_dim: List[int] = [0, 1, 2, 5, 8, 9],
-        backend_args: dict = None
-    ):
-        pass
-    
     def transform(self, results: dict) -> dict:
-        """
-        加载雷达点云并添加到results字典
-        
-        Args:
-            results: 包含radar_path的数据字典
-            
-        Returns:
-            results: 添加了radar_points的数据字典
-        """
+        # 计算方位角特征并扩展点云维度
         pass
 ```
 
-### 2. LoadRadarPointsFromMultiSweeps (多帧雷达加载)
-
-```python
-@TRANSFORMS.register_module()
-class LoadRadarPointsFromMultiSweeps(BaseTransform):
-    """
-    加载多帧雷达点云并合并
-    
-    将历史帧的雷达点云变换到当前帧坐标系后合并，
-    增加雷达点云的密度。
-    
-    Args:
-        sweeps_num (int): 加载的历史帧数量，默认5
-        load_dim (int): 加载的特征维度
-        use_dim (list[int]): 使用的特征维度
-        pad_empty_sweeps (bool): 是否用当前帧填充空sweep
-        remove_close (bool): 是否移除过近的点
-        close_radius (float): 过近点的半径阈值
-    """
-    
-    def transform(self, results: dict) -> dict:
-        """
-        加载多帧雷达点云
-        
-        处理流程:
-        1. 获取当前帧雷达点云
-        2. 遍历历史sweep
-        3. 将历史帧点云变换到当前帧坐标系
-        4. 合并所有点云
-        """
-        pass
-```
-
-### 3. RadarPointsRangeFilter (雷达点云范围过滤)
-
-```python
-@TRANSFORMS.register_module()
-class RadarPointsRangeFilter(BaseTransform):
-    """
-    过滤超出范围的雷达点云
-    
-    Args:
-        point_cloud_range (list): 点云范围 [x_min, y_min, z_min, x_max, y_max, z_max]
-    """
-    
-    def transform(self, results: dict) -> dict:
-        """
-        过滤雷达点云
-        
-        保留在point_cloud_range内的点
-        """
-        pass
-```
-
-### 4. BEVFusionWithRadar (扩展的BEVFusion模型)
+### 2. GeometryAwareVelocityEncoder
 
 ```python
 @MODELS.register_module()
-class BEVFusionWithRadar(BEVFusion):
+class GeometryAwareVelocityEncoder(nn.Module):
     """
-    支持雷达分支的BEVFusion模型
-    
-    在原有BEVFusion基础上添加雷达处理分支:
-    - radar_voxel_layer: 雷达点云体素化
-    - radar_voxel_encoder: 雷达体素特征编码 (PillarFeatureNet)
-    - radar_middle_encoder: 雷达中间编码器 (PointPillarsScatter)
+    几何感知的雷达速度BEV编码器
     
     Args:
-        radar_voxel_encoder (dict): 雷达体素编码器配置
-        radar_middle_encoder (dict): 雷达中间编码器配置
-        其他参数同BEVFusion
+        point_cloud_range (list): 点云范围
+        bev_size (tuple): BEV网格大小
+        hidden_channels (list): MLP隐藏层通道数
     """
-    
-    def __init__(
-        self,
-        radar_voxel_encoder: Optional[dict] = None,
-        radar_middle_encoder: Optional[dict] = None,
-        **kwargs
-    ):
-        pass
-    
-    def extract_radar_feat(self, batch_inputs_dict) -> torch.Tensor:
-        """
-        提取雷达BEV特征
-        
-        处理流程:
-        1. 获取雷达点云
-        2. 体素化
-        3. Pillar特征编码
-        4. Scatter到BEV空间
-        
-        Args:
-            batch_inputs_dict: 包含radar_points的输入字典
-            
-        Returns:
-            radar_bev_feat: 雷达BEV特征 [B, C, H, W]
-        """
-        pass
-    
-    def extract_feat(self, batch_inputs_dict, batch_input_metas, **kwargs):
-        """
-        提取并融合多模态特征 (重写父类方法)
-        
-        在原有图像和激光雷达特征基础上，添加雷达特征
-        """
+    def forward(self, radar_points, batch_size) -> torch.Tensor:
+        # 返回 velocity_bev [B, 4, H, W]
         pass
 ```
 
-### 5. 配置文件结构
+### 3. VelocityRefinementModule
 
 ```python
-# bevfusion_lidar-cam-radar_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py
-
-model = dict(
-    type='BEVFusionWithRadar',
+@MODELS.register_module()
+class VelocityRefinementModule(nn.Module):
+    """
+    速度校准模块
     
-    # 雷达体素化配置 (在data_preprocessor中)
-    data_preprocessor=dict(
-        type='Det3DDataPreprocessor',
-        voxelize_cfg=dict(
-            # LiDAR体素化配置
-            ...
-        ),
-        radar_voxelize_cfg=dict(
-            max_num_points=10,
-            point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
-            voxel_size=[0.5, 0.5, 8.0],
-            max_voxels=(30000, 40000),
-        ),
-    ),
-    
-    # 雷达编码器配置
-    radar_voxel_encoder=dict(
-        type='PillarFeatureNet',
-        in_channels=6,  # x, y, z, rcs, vx_comp, vy_comp
-        feat_channels=[64],
-        with_distance=False,
-        voxel_size=[0.5, 0.5, 8.0],
-        point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
-    ),
-    
-    radar_middle_encoder=dict(
-        type='PointPillarsScatter',
-        in_channels=64,
-        output_shape=[216, 216],  # 与LiDAR BEV尺寸一致
-    ),
-    
-    # 更新融合层配置
-    fusion_layer=dict(
-        type='ConvFuser',
-        in_channels=[80, 256, 64],  # [img, lidar, radar]
-        out_channels=256,
-    ),
-)
-
-# 数据管道配置
-train_pipeline = [
-    # ... 图像加载 ...
-    # ... LiDAR加载 ...
-    
-    # 雷达数据加载
-    dict(
-        type='LoadRadarPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=18,
-        use_dim=[0, 1, 2, 5, 8, 9],
-    ),
-    dict(
-        type='LoadRadarPointsFromMultiSweeps',
-        sweeps_num=5,
-        use_dim=[0, 1, 2, 5, 8, 9],
-    ),
-    
-    # ... 数据增强 ...
-    
-    dict(
-        type='RadarPointsRangeFilter',
-        point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
-    ),
-    
-    # Pack时包含radar_points
-    dict(
-        type='Pack3DDetInputs',
-        keys=['points', 'img', 'radar_points', 'gt_bboxes_3d', 'gt_labels_3d'],
-    ),
-]
-
-# 数据集模态配置
-input_modality = dict(
-    use_lidar=True,
-    use_camera=True,
-    use_radar=True,  # 新增
-)
+    Args:
+        hidden_channel (int): 隐藏层通道数
+    """
+    def forward(self, pred_velocity, velocity_bev, query_pos) -> torch.Tensor:
+        # 返回校准后的速度
+        pass
 ```
 
-## Data Models
+## 数据模型
 
-### 雷达点云数据结构
+### 雷达点云格式
 
-```python
-# nuScenes雷达点云原始格式 (18维)
-radar_points_raw = np.ndarray  # shape: [N, 18]
-# 维度说明:
-# 0: x - X坐标 (m)
-# 1: y - Y坐标 (m)
-# 2: z - Z坐标 (m)
-# 3: dyn_prop - 动态属性
-# 4: id - 点ID
-# 5: rcs - 雷达散射截面 (dBsm)
-# 6: vx - X方向速度 (m/s)
-# 7: vy - Y方向速度 (m/s)
-# 8: vx_comp - 补偿后X方向速度 (m/s)
-# 9: vy_comp - 补偿后Y方向速度 (m/s)
-# 10: is_quality_valid - 质量有效标志
-# 11: ambig_state - 模糊状态
-# 12: x_rms - X位置误差
-# 13: y_rms - Y位置误差
-# 14: invalid_state - 无效状态
-# 15: pdh0 - 检测概率
-# 16: vx_rms - X速度误差
-# 17: vy_rms - Y速度误差
+原始格式（18维）：
+- 0-2: x, y, z
+- 5: rcs
+- 8-9: vx_comp, vy_comp
+- 16-17: vx_rms, vy_rms
 
-# 处理后的雷达点云 (6维)
-radar_points = np.ndarray  # shape: [N, 6]
-# 维度说明:
-# 0: x - X坐标
-# 1: y - Y坐标
-# 2: z - Z坐标
-# 3: rcs - 雷达散射截面
-# 4: vx_comp - 补偿后X方向速度
-# 5: vy_comp - 补偿后Y方向速度
-```
+增强格式（10维）：
+- 0-2: x, y, z
+- 3: rcs
+- 4-5: vx_comp, vy_comp
+- 6-7: sin_theta, cos_theta
+- 8-9: vx_rms, vy_rms
 
-### 体素化数据结构
+### 输出特征
 
-```python
-# 体素化输出
-voxels = torch.Tensor  # shape: [M, max_points, 6]
-coords = torch.Tensor  # shape: [M, 3], (z_idx, y_idx, x_idx)
-num_points = torch.Tensor  # shape: [M]
+- 语义BEV特征：[B, 64, 180, 180]
+- 速度BEV图：[B, 4, 180, 180]
+- 融合BEV特征：[B, 256, 180, 180]
 
-# Pillar特征
-pillar_features = torch.Tensor  # shape: [M, 64]
+## 正确性属性
 
-# BEV特征
-radar_bev_feat = torch.Tensor  # shape: [B, 64, H, W]
-```
+*正确性属性是系统在所有有效执行中都应保持为真的特征或行为。*
 
-### 融合特征数据结构
+### Property 1: 几何增强输出正确性
 
-```python
-# 各模态BEV特征
-img_bev_feat = torch.Tensor  # shape: [B, 80, H, W]
-pts_bev_feat = torch.Tensor  # shape: [B, 256, H, W]
-radar_bev_feat = torch.Tensor  # shape: [B, 64, H, W]
+*For any* 雷达点云输入，几何增强后的输出应当满足：输出维度为10，且sin²θ + cos²θ = 1（在数值误差范围内），当norm接近零时sin θ = cos θ = 0。
 
-# 融合后特征
-fused_bev_feat = torch.Tensor  # shape: [B, 256, H, W]
-```
+**Validates: Requirements 1.2, 1.4, 1.5**
 
-## Correctness Properties
+### Property 2: 语义路径输出形状
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system-essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+*For any* 有效的雷达点云输入（包括空输入），语义特征路径应当输出形状为[B, 64, H, W]的BEV特征。
 
-### Property 1: Radar Data Loading Completeness
+**Validates: Requirements 2.3, 2.4, 2.5**
 
-*For any* valid nuScenes sample with radar data, loading radar points from all 5 sensors SHALL produce a non-empty point cloud with correct feature dimensions matching the configured use_dim.
+### Property 3: 速度路径输出形状
 
-**Validates: Requirements 1.1, 1.3**
+*For any* 有效的雷达点云输入（包括空输入），物理速度路径应当输出形状为[B, 4, H, W]的速度图。
 
-### Property 2: Coordinate Transformation Consistency
+**Validates: Requirements 3.3, 3.5**
 
-*For any* radar point, transforming from sensor coordinate to LiDAR coordinate and back to sensor coordinate SHALL produce coordinates within numerical tolerance of the original.
+### Property 4: 速度值保留
 
-**Validates: Requirements 1.2**
-
-### Property 3: Multi-Sweep Temporal Aggregation
-
-*For any* valid nuScenes sample with historical sweeps, loading N sweeps SHALL produce a point cloud with point count greater than or equal to the single-frame point count.
-
-**Validates: Requirements 1.4**
-
-### Property 4: Range Filtering Correctness
-
-*For any* radar point cloud and point cloud range configuration, all points in the filtered output SHALL have coordinates within the specified range bounds.
-
-**Validates: Requirements 2.1, 2.4**
-
-### Property 5: Augmentation Consistency
-
-*For any* data augmentation applied to LiDAR points, the same transformation matrix SHALL be applied to radar points, maintaining geometric consistency between modalities.
-
-**Validates: Requirements 2.2, 2.3**
-
-### Property 6: Radar Encoder Output Shape
-
-*For any* valid radar point cloud input, the Radar_Encoder SHALL output BEV features with shape [B, C, H, W] where C matches the configured output channels and H, W match the LiDAR BEV spatial dimensions.
-
-**Validates: Requirements 3.1, 3.3**
-
-### Property 7: Empty Input Handling
-
-*For any* empty radar point cloud input, the Radar_Encoder SHALL return zero-filled BEV features with the correct output shape.
+*For any* 非空雷达点云，对于BEV网格中只有一个雷达点的位置，输出的vx, vy应当等于输入的vx_comp, vy_comp。
 
 **Validates: Requirements 3.4**
 
-### Property 8: Fusion Layer Channel Consistency
+### Property 5: 融合层输出形状
 
-*For any* list of BEV features from N modalities, the Fusion_Layer output channel count SHALL equal the configured out_channels, regardless of the number of input modalities.
+*For any* 有效的多模态BEV特征输入，融合层应当输出形状为[B, 256, H, W]的融合特征。
 
-**Validates: Requirements 4.2, 4.3, 4.5**
+**Validates: Requirements 4.2, 4.3**
 
-### Property 9: Modality Flexibility
+### Property 6: 模态灵活性
 
-*For any* subset of modalities (camera, LiDAR, radar), the Fusion_Layer SHALL produce valid output when given the corresponding BEV features.
+*For any* 模态子集，融合层应当能够正确处理并产生有效输出。
 
-**Validates: Requirements 4.1, 4.4**
+**Validates: Requirements 4.4**
 
-### Property 10: Configuration Backward Compatibility
+### Property 7: 速度采样正确性
 
-*For any* BEVFusion configuration without radar branch, the BEVFusionWithRadar model SHALL produce identical results to the original BEVFusion model.
+*For any* 预测的物体中心点位置，从物理速度图中采样的速度值应当与该位置的雷达观测值一致。
 
-**Validates: Requirements 5.2, 5.3**
+**Validates: Requirements 5.1**
 
-## Error Handling
+### Property 8: 速度校准回退
 
-### 数据加载错误
+*For any* 物理速度图中置信度为零的位置，速度校准模块的输出应当等于网络预测的速度值。
+
+**Validates: Requirements 5.4**
+
+### Property 9: 范围过滤正确性
+
+*For any* 雷达点云和点云范围配置，过滤后的所有点都应当在指定范围内。
+
+**Validates: Requirements 6.4**
+
+### Property 10: 增强一致性
+
+*For any* 数据增强操作，应用于LiDAR点云的变换矩阵应当与应用于雷达点云的变换矩阵相同。
+
+**Validates: Requirements 6.5**
+
+### Property 11: 后向兼容性
+
+*For any* 不配置雷达分支的BEVFusionWithRadar模型，其行为应当与原BEVFusion模型完全一致。
+
+**Validates: Requirements 7.3**
+
+## 错误处理
 
 | 错误类型 | 处理策略 |
 |---------|---------|
 | 雷达文件不存在 | 返回空点云，记录警告日志 |
-| 雷达文件损坏 | 返回空点云，记录错误日志 |
-| 标定矩阵缺失 | 跳过该传感器，记录警告 |
-| Sweep数据不足 | 用当前帧填充或减少sweep数量 |
-
-### 特征编码错误
-
-| 错误类型 | 处理策略 |
-|---------|---------|
+| norm接近零 | 将sin θ和cos θ设置为0 |
 | 空点云输入 | 返回零填充的BEV特征 |
-| 体素数量超限 | 截断到max_voxels |
-| 内存不足 | 减少batch_size或voxel数量 |
-
-### 融合错误
-
-| 错误类型 | 处理策略 |
-|---------|---------|
 | 特征尺寸不匹配 | 使用插值对齐到目标尺寸 |
-| 模态缺失 | 跳过该模态，使用可用模态融合 |
 
-## Testing Strategy
+## 测试策略
 
 ### 单元测试
 
-1. **数据加载测试**
-   - 测试单帧雷达加载
-   - 测试多帧sweep加载
-   - 测试坐标变换正确性
-   - 测试错误处理
-
-2. **预处理测试**
-   - 测试范围过滤
-   - 测试数据增强一致性
-
-3. **编码器测试**
-   - 测试体素化输出形状
-   - 测试Pillar编码输出
-   - 测试空输入处理
-
-4. **融合层测试**
-   - 测试多模态输入
-   - 测试单模态输入
-   - 测试输出形状
+1. 几何增强测试：输出维度、三角函数恒等式、边界条件
+2. 语义路径测试：体素化输出、Pillar编码、空输入处理
+3. 速度路径测试：MLP输出、BEV投影、速度值保留
+4. 融合层测试：多模态输入、输出形状
+5. 速度校准测试：采样正确性、回退逻辑
 
 ### Property-Based Tests
 
-使用hypothesis库进行属性测试：
-
-```python
-from hypothesis import given, strategies as st
-
-@given(st.lists(st.floats(min_value=-100, max_value=100), min_size=6, max_size=6))
-def test_range_filter_property(point):
-    """Property 4: 范围过滤正确性"""
-    # 生成随机点，验证过滤后的点都在范围内
-    pass
-
-@given(st.integers(min_value=0, max_value=1000))
-def test_encoder_output_shape_property(num_points):
-    """Property 6: 编码器输出形状"""
-    # 生成随机数量的点，验证输出形状正确
-    pass
-```
+使用hypothesis库进行属性测试，最少100次迭代。
 
 ### 集成测试
 
-1. **端到端推理测试**
-   - 使用nuScenes mini数据集
-   - 验证三模态融合推理正确性
-
-2. **训练测试**
-   - 验证梯度传播
-   - 验证损失收敛
-
-### 测试配置
-
-- Property-based tests: 最少100次迭代
-- 使用pytest + hypothesis框架
-- 测试覆盖率目标: >80%
-
+使用nuScenes mini数据集验证端到端推理和训练。

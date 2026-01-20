@@ -222,8 +222,8 @@ class ImageAug3D(BaseTransform):
             new_imgs.append(np.array(new_img).astype(np.float32))
             transforms.append(transform.numpy())
         data['img'] = new_imgs
-        # 更新标定矩阵：记录图像增强变换
-        data['img_aug_matrix'] = transforms
+        # 更新标定矩阵：记录图像增强变换（转换为numpy数组）
+        data['img_aug_matrix'] = np.stack(transforms, axis=0)
         return data
 
 
@@ -236,12 +236,13 @@ class BEVFusionRandomFlip3D:
     
     支持水平和垂直两个方向的翻转，同时更新：
     - 点云坐标 (points)
-    - 雷达点云坐标 (radar_points)
+    - 雷达点云坐标和速度 (radar_points)
     - 3D边界框
     - BEV分割掩码
     - LiDAR增强矩阵
     
     雷达点云与LiDAR点云使用相同的翻转变换，确保几何一致性。
+    雷达速度分量 (vx, vy) 也会同步翻转。
     
     Compared with `RandomFlip3D`, this class directly records the lidar
     augmentation matrix in the `data`.
@@ -256,6 +257,7 @@ class BEVFusionRandomFlip3D:
         
         雷达点云与LiDAR点云使用相同的翻转变换矩阵，
         确保多模态数据的几何一致性。
+        雷达速度分量 (vx, vy) 也会同步翻转。
         
         Args:
             data: 输入数据字典
@@ -277,6 +279,10 @@ class BEVFusionRandomFlip3D:
             # 对雷达点云应用相同的翻转变换
             if 'radar_points' in data:
                 data['radar_points'].flip('horizontal')
+                # 翻转雷达速度分量 vy (索引5)
+                radar_tensor = data['radar_points'].tensor
+                if radar_tensor.shape[1] > 5:
+                    radar_tensor[:, 5] = -radar_tensor[:, 5]  # vy_comp 取反
             if 'gt_bboxes_3d' in data:
                 data['gt_bboxes_3d'].flip('horizontal')
             if 'gt_masks_bev' in data:
@@ -290,6 +296,10 @@ class BEVFusionRandomFlip3D:
             # 对雷达点云应用相同的翻转变换
             if 'radar_points' in data:
                 data['radar_points'].flip('vertical')
+                # 翻转雷达速度分量 vx (索引4)
+                radar_tensor = data['radar_points'].tensor
+                if radar_tensor.shape[1] > 4:
+                    radar_tensor[:, 4] = -radar_tensor[:, 4]  # vx_comp 取反
             if 'gt_bboxes_3d' in data:
                 data['gt_bboxes_3d'].flip('vertical')
             if 'gt_masks_bev' in data:
@@ -358,6 +368,7 @@ class BEVFusionGlobalRotScaleTrans(GlobalRotScaleTrans):
         
         对LiDAR点云和雷达点云应用相同的旋转变换，
         确保多模态数据的几何一致性。
+        雷达速度分量 (vx, vy) 也会同步旋转。
         
         Args:
             input_dict (dict): 输入数据字典
@@ -384,6 +395,20 @@ class BEVFusionGlobalRotScaleTrans(GlobalRotScaleTrans):
         # 旋转雷达点云（使用相同的旋转角度）
         if 'radar_points' in input_dict:
             input_dict['radar_points'].rotate(noise_rotation)
+            
+            # 同步旋转雷达速度分量 (vx, vy)
+            # 速度是矢量，需要应用相同的旋转变换
+            radar_tensor = input_dict['radar_points'].tensor
+            if radar_tensor.shape[1] > 5:
+                vx = radar_tensor[:, 4].clone()
+                vy = radar_tensor[:, 5].clone()
+                
+                # 应用2D旋转: [vx', vy'] = R @ [vx, vy]
+                cos_angle = np.cos(noise_rotation)
+                sin_angle = np.sin(noise_rotation)
+                
+                radar_tensor[:, 4] = cos_angle * vx - sin_angle * vy
+                radar_tensor[:, 5] = sin_angle * vx + cos_angle * vy
 
     def _scale_bbox_points(self, input_dict: dict) -> None:
         """
@@ -632,6 +657,168 @@ class GridMask(BaseTransform):
 
         results.update(img=imgs)
         return results
+
+
+@TRANSFORMS.register_module()
+class RadarGeometryEnhancer(BaseTransform):
+    """
+    雷达点云几何增强预处理
+    
+    Radar point cloud geometry enhancement preprocessing.
+    
+    该类用于对雷达点云进行几何增强，引入方位角特征（sin θ, cos θ），
+    使模型能够理解径向速度的物理置信度。
+    
+    输入：6维雷达点云 [x, y, z, rcs, vx_comp, vy_comp]
+    输出：10维增强点云 [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms]
+    
+    方位角计算：
+    - norm = sqrt(x² + y²)
+    - sin_theta = y / norm
+    - cos_theta = x / norm
+    - 当 norm 接近零时，sin_theta = cos_theta = 0
+    
+    Required Keys:
+    - radar_points (BasePoints): 雷达点云数据，至少包含6维特征
+    
+    Modified Keys:
+    - radar_points (BasePoints): 增强后的10维雷达点云数据
+    
+    Args:
+        eps (float): 避免除零的小量，默认1e-6
+            Small value to avoid division by zero. Defaults to 1e-6.
+        vx_rms_default (float): vx_rms的默认值（当原始数据不包含时）
+            Default value for vx_rms. Defaults to 0.1.
+        vy_rms_default (float): vy_rms的默认值（当原始数据不包含时）
+            Default value for vy_rms. Defaults to 0.1.
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-6,
+        vx_rms_default: float = 0.1,
+        vy_rms_default: float = 0.1
+    ) -> None:
+        """
+        初始化几何增强器参数
+        
+        Args:
+            eps: 避免除零的小量
+            vx_rms_default: vx_rms的默认值
+            vy_rms_default: vy_rms的默认值
+        """
+        self.eps = eps
+        self.vx_rms_default = vx_rms_default
+        self.vy_rms_default = vy_rms_default
+
+    def transform(self, results: dict) -> dict:
+        """
+        对雷达点云进行几何增强
+        
+        Transform function to enhance radar points with geometry features.
+        
+        处理流程：
+        1. 获取雷达点云
+        2. 计算方位角的三角函数值（sin θ, cos θ）
+        3. 处理 norm 接近零的边界情况
+        4. 获取或设置速度不确定度（vx_rms, vy_rms）
+        5. 组合输出10维增强点云
+        
+        Args:
+            results (dict): 包含雷达点云的结果字典
+                Result dict containing radar points.
+
+        Returns:
+            dict: 包含增强后雷达点云的结果字典
+                Result dict with enhanced radar points.
+        """
+        # 检查是否存在雷达点云
+        if 'radar_points' not in results:
+            return results
+        
+        radar_points = results['radar_points']
+        
+        # 如果雷达点云为空，直接返回
+        if len(radar_points) == 0:
+            return results
+        
+        # 获取点云数据（numpy数组）
+        points_tensor = radar_points.tensor.numpy()
+        num_points = points_tensor.shape[0]
+        current_dim = points_tensor.shape[1]
+        
+        # 提取坐标 (x, y)
+        x = points_tensor[:, 0]
+        y = points_tensor[:, 1]
+        
+        # 计算方位角的三角函数值
+        # norm = sqrt(x² + y²)
+        norm = np.sqrt(x ** 2 + y ** 2)
+        
+        # 处理 norm 接近零的边界情况
+        # 当 norm < eps 时，设置 sin_theta = cos_theta = 0
+        valid_mask = norm > self.eps
+        
+        sin_theta = np.zeros(num_points, dtype=np.float32)
+        cos_theta = np.zeros(num_points, dtype=np.float32)
+        
+        # 只对有效点计算三角函数值
+        sin_theta[valid_mask] = y[valid_mask] / norm[valid_mask]
+        cos_theta[valid_mask] = x[valid_mask] / norm[valid_mask]
+        
+        # 获取或设置速度不确定度
+        # 如果原始数据包含 vx_rms, vy_rms（维度 >= 8），则使用原始值
+        # 否则使用默认值
+        if current_dim >= 8:
+            # 假设维度顺序为 [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms]
+            vx_rms = points_tensor[:, 6]
+            vy_rms = points_tensor[:, 7]
+        else:
+            # 使用默认值
+            vx_rms = np.full(num_points, self.vx_rms_default, dtype=np.float32)
+            vy_rms = np.full(num_points, self.vy_rms_default, dtype=np.float32)
+        
+        # 组合输出10维增强点云
+        # [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms]
+        enhanced_points = np.zeros((num_points, 10), dtype=np.float32)
+        
+        # 复制原始的6维特征 [x, y, z, rcs, vx_comp, vy_comp]
+        enhanced_points[:, :6] = points_tensor[:, :6]
+        
+        # 添加方位角特征
+        enhanced_points[:, 6] = sin_theta
+        enhanced_points[:, 7] = cos_theta
+        
+        # 添加速度不确定度
+        enhanced_points[:, 8] = vx_rms
+        enhanced_points[:, 9] = vy_rms
+        
+        # 创建新的点云对象
+        # 注意：不能使用 radar_points.new_point()，因为它会保留原始的 points_dim
+        # 我们需要创建一个新的点云对象，指定正确的 points_dim=10
+        import torch
+        from mmdet3d.structures import LiDARPoints
+        
+        # 转换为 tensor
+        enhanced_tensor = torch.from_numpy(enhanced_points).to(radar_points.tensor.device)
+        
+        # 创建新的 LiDARPoints 对象，指定 points_dim=10
+        new_radar_points = LiDARPoints(
+            enhanced_tensor,
+            points_dim=10,
+            attribute_dims=None
+        )
+        
+        results['radar_points'] = new_radar_points
+        return results
+
+    def __repr__(self) -> str:
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(eps={self.eps}, '
+        repr_str += f'vx_rms_default={self.vx_rms_default}, '
+        repr_str += f'vy_rms_default={self.vy_rms_default})'
+        return repr_str
 
 
 @TRANSFORMS.register_module()
