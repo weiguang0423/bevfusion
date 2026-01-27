@@ -264,12 +264,18 @@ class Det3DDataset(BaseDataset):
         """计算雷达到LiDAR的变换矩阵
         
         Args:
-            radar_data (dict): 雷达传感器数据，包含 sensor2lidar_rotation 和 
-                sensor2lidar_translation
+            radar_data (dict): 雷达传感器数据，可能包含：
+                - radar2lidar: 直接的4x4变换矩阵，或
+                - sensor2lidar_rotation 和 sensor2lidar_translation: 分离的旋转和平移
         
         Returns:
             np.ndarray: 4x4 变换矩阵
         """
+        # 优先使用直接的 radar2lidar 矩阵
+        if 'radar2lidar' in radar_data:
+            return np.array(radar_data['radar2lidar'], dtype=np.float32)
+        
+        # 否则从分离的旋转和平移构建
         radar2lidar = np.eye(4, dtype=np.float32)
         if 'sensor2lidar_rotation' in radar_data:
             radar2lidar[:3, :3] = np.array(radar_data['sensor2lidar_rotation'])

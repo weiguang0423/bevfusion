@@ -341,7 +341,12 @@ if __name__ == '__main__':
                                         args.extra_tag,
                                         f'{args.extra_tag}_infos_train.pkl')
         else:
-            train_version = f'{args.version}-trainval'
+            # 修复：如果 version 已经包含 -trainval 或 -test，不要重复添加
+            if '-trainval' in args.version:
+                train_version = args.version
+            else:
+                train_version = f'{args.version}-trainval'
+            
             nuscenes_data_prep(
                 root_path=args.root_path,
                 info_prefix=args.extra_tag,
@@ -349,7 +354,12 @@ if __name__ == '__main__':
                 dataset_name='NuScenesDataset',
                 out_dir=args.out_dir,
                 max_sweeps=args.max_sweeps)
-            test_version = f'{args.version}-test'
+            
+            if '-test' in args.version:
+                test_version = args.version
+            else:
+                test_version = f'{args.version}-test'
+            
             nuscenes_data_prep(
                 root_path=args.root_path,
                 info_prefix=args.extra_tag,

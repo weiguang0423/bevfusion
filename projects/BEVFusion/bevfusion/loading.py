@@ -460,11 +460,13 @@ class LoadRadarPointsFromFile(BaseTransform):
                 
                 # 获取雷达到LiDAR的变换矩阵
                 if 'radar2lidar' in sensor_info:
-                    radar2lidar = np.array(sensor_info['radar2lidar'])
+                    radar2lidar = np.array(sensor_info['radar2lidar']).astype(np.float32)
                     # 应用坐标变换：将雷达点从传感器坐标系转换到LiDAR坐标系
-                    # 变换公式: p_lidar = R @ p_radar + t
-                    points[:, :3] = points[:, :3] @ radar2lidar[:3, :3].T
-                    points[:, :3] += radar2lidar[:3, 3]
+                    # 变换公式: p_lidar = (R @ p_radar^T + t)^T = p_radar @ R^T + t^T
+                    points_homo = np.ones((points.shape[0], 4), dtype=np.float32)
+                    points_homo[:, :3] = points[:, :3]
+                    points_transformed = points_homo @ radar2lidar.T
+                    points[:, :3] = points_transformed[:, :3]
                     
                     # 如果有速度信息，也需要变换（只旋转，不平移）
                     # vx, vy 在索引 6, 7；vx_comp, vy_comp 在索引 8, 9
@@ -655,8 +657,13 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
         1. 获取当前帧雷达点云
         2. 选择历史帧（随机或顺序）
         3. 加载历史帧雷达点云并变换到当前帧坐标系
-        4. 添加时间戳差作为特征（如果需要）
+        4. 添加时间戳差作为特征（关键步骤！）
         5. 拼接所有帧的点云
+        
+        时间戳差（dt）的物理意义：
+        - 当前帧: dt = 0.0
+        - 历史帧: dt = current_timestamp - sweep_timestamp (正值，单位：秒)
+        - 网络可以利用 dt 进行位置校正: x_real ≈ x_radar + vx · dt
         
         Args:
             results (dict): 包含雷达点云和sweep信息的结果字典
@@ -672,21 +679,37 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
             return results
         
         points = results['radar_points']
-        sweep_points_list = [points]
         
         # 获取当前帧时间戳
         ts = results.get('timestamp', 0)
         
+        # 为当前帧点云添加时间戳 dt=0.0
+        # 当前帧点云维度: [N, D] -> [N, D+1]
+        current_points_numpy = points.tensor.numpy()
+        num_current_points = current_points_numpy.shape[0]
+        current_dim = current_points_numpy.shape[1]
+        
+        # 添加 dt=0.0 作为最后一维
+        current_dt = np.zeros((num_current_points, 1), dtype=np.float32)
+        current_points_with_dt = np.concatenate([current_points_numpy, current_dt], axis=1)
+        
+        # 创建新的点云对象（维度 +1）
+        import torch
+        current_points_tensor = torch.from_numpy(current_points_with_dt).to(points.tensor.device)
+        points_with_dt = points.new_point(current_points_tensor)
+        
+        sweep_points_list = [points_with_dt]
+        
         # 如果没有历史帧信息
         if 'radar_sweeps' not in results or len(results['radar_sweeps']) == 0:
             if self.pad_empty_sweeps:
-                # 复制当前帧填充
+                # 复制当前帧填充（dt=0.0）
                 for i in range(self.sweeps_num):
                     if self.remove_close:
                         sweep_points_list.append(
-                            self._remove_close(points, self.close_radius))
+                            self._remove_close(points_with_dt, self.close_radius))
                     else:
-                        sweep_points_list.append(points)
+                        sweep_points_list.append(points_with_dt)
         else:
             radar_sweeps = results['radar_sweeps']
             
@@ -707,6 +730,12 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
             # 加载并处理每一帧历史点云
             for idx in choices:
                 sweep = radar_sweeps[idx]
+                
+                # 获取该 sweep 的时间戳
+                sweep_ts = sweep.get('timestamp', ts)
+                # 计算时间差 dt（单位：秒）
+                # dt > 0 表示历史帧，dt 越大表示越早的帧
+                time_lag = ts - sweep_ts
                 
                 # 收集该sweep中所有雷达传感器的点云
                 sweep_all_points = []
@@ -765,15 +794,24 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
                 # 选择需要的维度
                 points_sweep = points_sweep[:, self.use_dim]
                 
-                # 创建点云对象
-                points_sweep = points.new_point(points_sweep)
-                sweep_points_list.append(points_sweep)
+                # 【关键步骤】添加时间戳差 dt 作为最后一维
+                # 这是多帧融合的核心：让网络知道每个点来自多久之前
+                num_sweep_points = points_sweep.shape[0]
+                sweep_dt = np.full((num_sweep_points, 1), time_lag, dtype=np.float32)
+                points_sweep_with_dt = np.concatenate([points_sweep, sweep_dt], axis=1)
+                
+                # 创建点云对象（维度 +1）
+                import torch
+                points_sweep_tensor = torch.from_numpy(points_sweep_with_dt).to(points.tensor.device)
+                points_sweep_obj = points_with_dt.new_point(points_sweep_tensor)
+                sweep_points_list.append(points_sweep_obj)
         
         # 拼接所有帧的点云
+        # 注意：现在点云维度是 [N, D+1]，最后一维是时间戳 dt
         if len(sweep_points_list) > 1:
-            points = points.cat(sweep_points_list)
+            points_with_dt = points_with_dt.cat(sweep_points_list)
         
-        results['radar_points'] = points
+        results['radar_points'] = points_with_dt
         return results
 
     def __repr__(self) -> str:

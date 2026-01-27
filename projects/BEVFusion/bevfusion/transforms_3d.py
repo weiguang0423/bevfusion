@@ -669,8 +669,8 @@ class RadarGeometryEnhancer(BaseTransform):
     该类用于对雷达点云进行几何增强，引入方位角特征（sin θ, cos θ），
     使模型能够理解径向速度的物理置信度。
     
-    输入：6维雷达点云 [x, y, z, rcs, vx_comp, vy_comp]
-    输出：10维增强点云 [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms]
+    输入：9维雷达点云 [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms, dt]
+    输出：11维增强点云 [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms, dt]
     
     方位角计算：
     - norm = sqrt(x² + y²)
@@ -678,11 +678,16 @@ class RadarGeometryEnhancer(BaseTransform):
     - cos_theta = x / norm
     - 当 norm 接近零时，sin_theta = cos_theta = 0
     
+    时间戳（dt）的作用：
+    - 当前帧: dt = 0.0
+    - 历史帧: dt > 0（单位：秒）
+    - 网络可以利用 dt 进行位置校正和速度推断
+    
     Required Keys:
-    - radar_points (BasePoints): 雷达点云数据，至少包含6维特征
+    - radar_points (BasePoints): 雷达点云数据，包含9维特征（含时间戳）
     
     Modified Keys:
-    - radar_points (BasePoints): 增强后的10维雷达点云数据
+    - radar_points (BasePoints): 增强后的11维雷达点云数据
     
     Args:
         eps (float): 避免除零的小量，默认1e-6
@@ -691,13 +696,19 @@ class RadarGeometryEnhancer(BaseTransform):
             Default value for vx_rms. Defaults to 0.1.
         vy_rms_default (float): vy_rms的默认值（当原始数据不包含时）
             Default value for vy_rms. Defaults to 0.1.
+        debug_vis (bool): 是否启用调试可视化，默认False
+            Enable debug visualization. Defaults to False.
+        debug_prob (float): 调试可视化的采样概率，默认0.01 (1%)
+            Probability of debug visualization. Defaults to 0.01.
     """
 
     def __init__(
         self,
         eps: float = 1e-6,
         vx_rms_default: float = 0.1,
-        vy_rms_default: float = 0.1
+        vy_rms_default: float = 0.1,
+        debug_vis: bool = False,
+        debug_prob: float = 0.01
     ) -> None:
         """
         初始化几何增强器参数
@@ -706,10 +717,15 @@ class RadarGeometryEnhancer(BaseTransform):
             eps: 避免除零的小量
             vx_rms_default: vx_rms的默认值
             vy_rms_default: vy_rms的默认值
+            debug_vis: 是否启用调试可视化
+            debug_prob: 调试可视化的采样概率
         """
         self.eps = eps
         self.vx_rms_default = vx_rms_default
         self.vy_rms_default = vy_rms_default
+        self.debug_vis = debug_vis
+        self.debug_prob = debug_prob
+        self._debug_counter = 0
 
     def transform(self, results: dict) -> dict:
         """
@@ -718,11 +734,16 @@ class RadarGeometryEnhancer(BaseTransform):
         Transform function to enhance radar points with geometry features.
         
         处理流程：
-        1. 获取雷达点云
+        1. 获取雷达点云（9维，含时间戳 dt）
         2. 计算方位角的三角函数值（sin θ, cos θ）
         3. 处理 norm 接近零的边界情况
         4. 获取或设置速度不确定度（vx_rms, vy_rms）
-        5. 组合输出10维增强点云
+        5. 保留时间戳 dt
+        6. 组合输出11维增强点云
+        
+        维度变化：
+        - 输入: [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms, dt] (9维)
+        - 输出: [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms, dt] (11维)
         
         Args:
             results (dict): 包含雷达点云的结果字典
@@ -747,6 +768,9 @@ class RadarGeometryEnhancer(BaseTransform):
         num_points = points_tensor.shape[0]
         current_dim = points_tensor.shape[1]
         
+        # 提取基础特征 [x, y, z, rcs, vx_comp, vy_comp] (前6维)
+        base_feats = points_tensor[:, :6]
+        
         # 提取坐标 (x, y)
         x = points_tensor[:, 0]
         y = points_tensor[:, 1]
@@ -766,11 +790,14 @@ class RadarGeometryEnhancer(BaseTransform):
         sin_theta[valid_mask] = y[valid_mask] / norm[valid_mask]
         cos_theta[valid_mask] = x[valid_mask] / norm[valid_mask]
         
+        # 堆叠几何特征
+        geom_feats = np.stack([sin_theta, cos_theta], axis=1)
+        
         # 获取或设置速度不确定度
         # 如果原始数据包含 vx_rms, vy_rms（维度 >= 8），则使用原始值
         # 否则使用默认值
         if current_dim >= 8:
-            # 假设维度顺序为 [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms]
+            # 假设维度顺序为 [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms, ...]
             vx_rms = points_tensor[:, 6]
             vy_rms = points_tensor[:, 7]
         else:
@@ -778,38 +805,125 @@ class RadarGeometryEnhancer(BaseTransform):
             vx_rms = np.full(num_points, self.vx_rms_default, dtype=np.float32)
             vy_rms = np.full(num_points, self.vy_rms_default, dtype=np.float32)
         
-        # 组合输出10维增强点云
-        # [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms]
-        enhanced_points = np.zeros((num_points, 10), dtype=np.float32)
+        # 堆叠 RMS 特征
+        rms_feats = np.stack([vx_rms, vy_rms], axis=1)
         
-        # 复制原始的6维特征 [x, y, z, rcs, vx_comp, vy_comp]
-        enhanced_points[:, :6] = points_tensor[:, :6]
+        # 【关键步骤】提取时间戳 dt（最后一维）
+        # 如果输入包含时间戳（维度 >= 9），则提取；否则设为 0.0
+        if current_dim >= 9:
+            time_feats = points_tensor[:, 8:9]  # 保持2D形状 [N, 1]
+        else:
+            # 如果没有时间戳，设为 0.0（当前帧）
+            time_feats = np.zeros((num_points, 1), dtype=np.float32)
         
-        # 添加方位角特征
-        enhanced_points[:, 6] = sin_theta
-        enhanced_points[:, 7] = cos_theta
-        
-        # 添加速度不确定度
-        enhanced_points[:, 8] = vx_rms
-        enhanced_points[:, 9] = vy_rms
+        # 组合输出11维增强点云
+        # [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms, dt]
+        enhanced_points = np.concatenate([
+            base_feats,   # 0-5: x, y, z, rcs, vx_comp, vy_comp
+            geom_feats,   # 6-7: sin_theta, cos_theta
+            rms_feats,    # 8-9: vx_rms, vy_rms
+            time_feats    # 10: dt (时间戳差)
+        ], axis=1)
         
         # 创建新的点云对象
         # 注意：不能使用 radar_points.new_point()，因为它会保留原始的 points_dim
-        # 我们需要创建一个新的点云对象，指定正确的 points_dim=10
+        # 我们需要创建一个新的点云对象，指定正确的 points_dim=11
         import torch
         from mmdet3d.structures import LiDARPoints
         
         # 转换为 tensor
         enhanced_tensor = torch.from_numpy(enhanced_points).to(radar_points.tensor.device)
         
-        # 创建新的 LiDARPoints 对象，指定 points_dim=10
+        # 创建新的 LiDARPoints 对象，指定 points_dim=11
         new_radar_points = LiDARPoints(
             enhanced_tensor,
-            points_dim=10,
+            points_dim=11,
             attribute_dims=None
         )
         
         results['radar_points'] = new_radar_points
+        
+        # 调试可视化（可选）
+        if self.debug_vis and np.random.random() < self.debug_prob:
+            self._debug_visualize(results)
+        
+        return results
+    
+    def _debug_visualize(self, results: dict) -> None:
+        """
+        调试可视化：检查增强后的对齐情况
+        
+        Args:
+            results: 数据字典
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from pathlib import Path
+            
+            # 创建输出目录
+            output_dir = Path('debug_vis_geometry')
+            output_dir.mkdir(exist_ok=True)
+            
+            fig, ax = plt.subplots(figsize=(10, 10))
+            
+            # LiDAR
+            if 'points' in results:
+                lidar = results['points'].tensor.numpy()
+                step = max(1, len(lidar) // 3000)
+                ax.scatter(lidar[::step, 0], lidar[::step, 1], 
+                          s=0.3, c='gray', alpha=0.3, label='LiDAR')
+            
+            # GT Boxes
+            if 'gt_bboxes_3d' in results:
+                gt = results['gt_bboxes_3d']
+                corners = gt.corners[:, [0, 3, 7, 4], :2].numpy()
+                centers = gt.gravity_center.numpy()[:, :2]
+                yaws = gt.tensor.numpy()[:, 6]
+                
+                for box, center, yaw in zip(corners, centers, yaws):
+                    box_closed = np.vstack([box, box[0]])
+                    ax.plot(box_closed[:, 0], box_closed[:, 1], 'g-', linewidth=1.5)
+                    ax.arrow(center[0], center[1], 
+                            np.cos(yaw)*2.5, np.sin(yaw)*2.5,
+                            head_width=0.8, head_length=0.6, 
+                            fc='green', ec='green')
+            
+            # Radar
+            if 'radar_points' in results:
+                radar = results['radar_points'].tensor.numpy()
+                rx, ry = radar[:, 0], radar[:, 1]
+                ax.scatter(rx, ry, s=25, c='red', marker='x', 
+                          linewidths=1.5, label='Radar', zorder=5)
+                
+                # Velocity arrows
+                if radar.shape[1] >= 6:
+                    vx, vy = radar[:, 4], radar[:, 5]
+                    vel_mag = np.sqrt(vx**2 + vy**2)
+                    mask = vel_mag > 0.5
+                    
+                    if mask.sum() > 0:
+                        ax.quiver(rx[mask], ry[mask], vx[mask], vy[mask],
+                                 vel_mag[mask], angles='xy', scale_units='xy',
+                                 scale=1.0, cmap='coolwarm', width=0.003, 
+                                 alpha=0.7, zorder=4)
+            
+            ax.legend()
+            ax.set_title(f'RadarGeometryEnhancer Debug (#{self._debug_counter})')
+            ax.set_xlim(-60, 60)
+            ax.set_ylim(-60, 60)
+            ax.grid(True, alpha=0.3)
+            ax.set_aspect('equal')
+            
+            save_path = output_dir / f'debug_{self._debug_counter:04d}.png'
+            plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.close()
+            
+            self._debug_counter += 1
+            
+        except Exception as e:
+            # 静默失败，不影响训练
+            pass
+        
         return results
 
     def __repr__(self) -> str:
@@ -817,7 +931,8 @@ class RadarGeometryEnhancer(BaseTransform):
         repr_str = self.__class__.__name__
         repr_str += f'(eps={self.eps}, '
         repr_str += f'vx_rms_default={self.vx_rms_default}, '
-        repr_str += f'vy_rms_default={self.vy_rms_default})'
+        repr_str += f'vy_rms_default={self.vy_rms_default}, '
+        repr_str += f'debug_vis={self.debug_vis})'
         return repr_str
 
 

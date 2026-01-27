@@ -266,15 +266,27 @@ def update_nuscenes_infos(pkl_path, out_dir):
         ('car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
          'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'),
     }
+    
+    # 兼容新旧格式
+    if 'metainfo' in data_list:
+        version = data_list['metainfo'].get('version', 'v1.0-trainval')
+        infos_list = data_list['data_list']
+    elif 'metadata' in data_list:
+        version = data_list['metadata']['version']
+        infos_list = data_list['infos']
+    else:
+        version = 'v1.0-trainval'
+        infos_list = data_list.get('infos', data_list.get('data_list', data_list))
+    
     nusc = NuScenes(
-        version=data_list['metadata']['version'],
+        version=version,
         dataroot='./data/nuscenes',
         verbose=True)
 
     print('Start updating:')
     converted_list = []
     for i, ori_info_dict in enumerate(
-            mmengine.track_iter_progress(data_list['infos'])):
+            mmengine.track_iter_progress(infos_list)):
         temp_data_info = get_empty_standard_data_info(
             camera_types=camera_types)
         temp_data_info['sample_idx'] = i
@@ -338,12 +350,13 @@ def update_nuscenes_infos(pkl_path, out_dir):
                 np.float32).tolist()
             temp_data_info['images'][cam] = empty_img_info
         
-        # 处理雷达信息（新增）
+        # 处理雷达信息
         if 'radars' in ori_info_dict:
             temp_data_info['radars'] = {}
             for radar_name, radar_data in ori_info_dict['radars'].items():
                 empty_radar_info = {}
-                empty_radar_info['radar_path'] = radar_data.get('data_path', '')
+                empty_radar_info['radar_path'] = Path(radar_data.get('data_path', '')).name
+                
                 # 计算 radar2lidar 变换矩阵
                 radar2lidar = np.eye(4)
                 if 'sensor2lidar_rotation' in radar_data:
@@ -354,12 +367,14 @@ def update_nuscenes_infos(pkl_path, out_dir):
                 empty_radar_info['radar2lidar'] = radar2lidar.astype(np.float32).tolist()
                 empty_radar_info['timestamp'] = radar_data.get('timestamp', 0) / 1e6
                 
-                # 处理雷达 sweeps
-                if 'sweeps' in radar_data:
-                    empty_radar_info['sweeps'] = []
+                # 处理雷达 sweeps - 使用 radar_sweeps 字段名
+                if 'sweeps' in radar_data and len(radar_data['sweeps']) > 0:
+                    empty_radar_info['radar_sweeps'] = []
                     for sweep in radar_data['sweeps']:
                         sweep_info = {}
                         sweep_info['radar_path'] = sweep.get('data_path', '')
+                        sweep_info['sample_data_token'] = sweep.get('sample_data_token', '')
+                        
                         # 计算 sweep 的 radar2lidar
                         sweep_radar2lidar = np.eye(4)
                         if 'sensor2lidar_rotation' in sweep:
@@ -369,7 +384,14 @@ def update_nuscenes_infos(pkl_path, out_dir):
                             sweep_radar2lidar[:3, 3] = trans
                         sweep_info['radar2lidar'] = sweep_radar2lidar.astype(np.float32).tolist()
                         sweep_info['timestamp'] = sweep.get('timestamp', 0) / 1e6
-                        empty_radar_info['sweeps'].append(sweep_info)
+                        
+                        # 添加 ego2global 信息
+                        if 'ego2global_rotation' in sweep and 'ego2global_translation' in sweep:
+                            sweep_info['ego2global'] = convert_quaternion_to_matrix(
+                                sweep['ego2global_rotation'],
+                                sweep['ego2global_translation'])
+                        
+                        empty_radar_info['radar_sweeps'].append(sweep_info)
                 
                 temp_data_info['radars'][radar_name] = empty_radar_info
 

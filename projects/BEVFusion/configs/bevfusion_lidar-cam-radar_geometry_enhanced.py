@@ -69,11 +69,11 @@ model = dict(
         ),
     ),
     # 雷达体素编码器配置 (PillarFeatureNet)
-    # 输入：9维点云 [x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms, time_delta]
-    # 注意：几何特征(sin_theta, cos_theta)在radar_velocity_encoder中实时计算
+    # 输入：11维增强点云 [x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms, dt]
+    # 其中 dt 是时间偏移量，是多帧融合的关键特征
     radar_voxel_encoder=dict(
         type='PillarFeatureNet',
-        in_channels=9,  # 8维原始点云 + 1维时间戳差
+        in_channels=11,  # 11维增强点云（包含时间戳 dt）
         feat_channels=[64],
         with_distance=False,
         voxel_size=radar_voxel_size,
@@ -180,6 +180,9 @@ train_pipeline = [
         rot_range=[-0.78539816, 0.78539816],
         translation_std=0.5),
     dict(type='BEVFusionRandomFlip3D'),
+    # 雷达几何增强：在旋转后计算方位角特征（sin θ, cos θ）
+    # 确保方位角是基于增强后的坐标计算的，避免时序陷阱
+    dict(type='RadarGeometryEnhancer'),
     # 点云范围过滤
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     # 雷达点云范围过滤
@@ -270,6 +273,8 @@ test_pipeline = [
         rot_lim=[0.0, 0.0],
         rand_flip=False,
         is_train=False),
+    # 雷达几何增强：测试时也需要计算方位角特征
+    dict(type='RadarGeometryEnhancer'),
     # 点云范围过滤
     dict(
         type='PointsRangeFilter',

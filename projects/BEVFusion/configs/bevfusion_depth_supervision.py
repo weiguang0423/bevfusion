@@ -95,7 +95,9 @@ env_cfg = dict(
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 input_modality = dict(use_camera=True, use_lidar=True)
 launcher = 'pytorch'
-load_from = '/root/mmdetection3d-main/work_dirs/bevfusion_depth_supervision/epoch_6.pth'
+# 加载官方Image+LiDAR预训练权重
+# 深度监督模块会自动随机初始化
+load_from = 'checkpoints/bevfusion_lidar_cam_converted.pth'
 log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
 lr = 0.0001
@@ -487,7 +489,18 @@ optim_wrapper = dict(
     loss_scale='dynamic',
     # Fine-tune with lower LR (about 1/5 of original 2e-4)
     optimizer=dict(lr=0.00004, type='AdamW', weight_decay=0.01),
-    type='AmpOptimWrapper')
+    type='AmpOptimWrapper',
+    # 分层学习率配置
+    paramwise_cfg=dict(
+        custom_keys={
+            # Backbone (Swin Transformer) 使用 0.1x 学习率
+            'img_backbone': dict(lr_mult=0.1),
+            # 深度监督相关模块使用 1.0x 学习率（默认）
+            'view_transform': dict(lr_mult=1.0),
+            # 其他模块使用默认学习率
+        }
+    )
+)
 param_scheduler = [
     dict(
         begin=0,
