@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "tools/preview_nuscenes.py", line 4, in <module>
+    dataset = NuScenesDataset(
+  File "/root/mmdetection3d-main/mmdet3d/datasets/nuscenes_dataset.py", line 102, in __init__
+    super().__init__(
+  File "/root/mmdetection3d-main/mmdet3d/datasets/det3d_dataset.py", line 126, in __init__
+    super().__init__(
+  File "/home/vipuser/miniconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine/dataset/base_dataset.py", line 247, in __init__
+    self.full_init()
+  File "/home/vipuser/miniconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine/dataset/base_dataset.py", line 298, in full_init
+    self.data_list = self.load_data_list()
+  File "/home/vipuser/miniconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine/dataset/base_dataset.py", line 435, in load_data_list
+    annotations = load(self.ann_file)
+  File "/home/vipuser/miniconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine/fileio/io.py", line 855, in load
+    with BytesIO(file_backend.get(file)) as f:
+  File "/home/vipuser/miniconda3/envs/bevfusion/lib/python3.8/site-packages/mmengine/fileio/backends/local_backend.py", line 33, in get
+    with open(filepath, 'rb') as f:
+FileNotFoundError: [Errno 2] No such file or directory: 'data/nuscenes/data/nuscenes/nuscenes_infos_train.pkl'

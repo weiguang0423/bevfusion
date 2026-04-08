@@ -11,6 +11,7 @@ import warnings
 
 # ============ 非CUDA依赖模块（可直接导入）============
 # 数据加载模块
+from .weather_eval_hook import WeatherEvalHook, EvidenceEpochHook, FreezeModulesHook
 from .loading import (BEVLoadMultiViewImageFromFiles, 
                       LoadRadarPointsFromFile,
                       LoadRadarPointsFromMultiSweeps,
@@ -51,7 +52,7 @@ except ImportError as e:
 
 __all__ = [
     # 非CUDA依赖模块
-    'BEVLoadMultiViewImageFromFiles', 'LoadRadarPointsFromFile',
+    'WeatherEvalHook', 'EvidenceEpochHook', 'FreezeModulesHook', 'BEVLoadMultiViewImageFromFiles', 'LoadRadarPointsFromFile',
     'LoadRadarPointsFromMultiSweeps', 'LoadDepthFromPoints',
     'BEVFusionGlobalRotScaleTrans',
     'BEVFusionRandomFlip3D', 'GridMask', 'ImageAug3D', 'RadarPointsRangeFilter',

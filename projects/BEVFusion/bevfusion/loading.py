@@ -1040,3 +1040,34 @@ class LoadDepthFromPoints(BaseTransform):
         repr_str += f'discretization={self.discretization}, '
         repr_str += f'dilation_kernel={self.dilation_kernel})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class LoadPreprocessedRadarPoints(BaseTransform):
+    def __init__(self, data_root='data/nuscenes', preprocessed_dir='radar_multisweep_preprocessed', use_dim=[0, 1, 2, 5, 8, 9, 16, 17], coord_type='LIDAR'):
+        import os
+        self.dir_path = os.path.join(data_root, preprocessed_dir)
+        self.use_dim = use_dim
+        self.coord_type = coord_type
+
+    def transform(self, results: dict) -> dict:
+        import numpy as np
+        import os
+        import warnings
+        from mmdet3d.structures.points import get_points_type
+        
+        token = results['token']
+        file_path = os.path.join(self.dir_path, f"{token}.npy")
+        
+        points_class = get_points_type(self.coord_type)
+        if not os.path.exists(file_path):
+            warnings.warn(f"Preprocessed radar points not found: {file_path}, returning empty")
+            points = np.zeros((0, len(self.use_dim) + 1), dtype=np.float32)
+        else:
+            points = np.load(file_path)
+            
+        results['radar_points'] = points_class(
+            points,
+            points_dim=points.shape[-1],
+            attribute_dims=None)
+        return results

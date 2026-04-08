@@ -515,7 +515,14 @@ class BEVFusion(Base3DDetector):
         if self.fusion_layer is not None:
             # 使用融合层融合图像和点云的BEV特征
             # 常见的融合方式：拼接后卷积、注意力机制等
-            x = self.fusion_layer(features)
+            fusion_result = self.fusion_layer(features)
+            if isinstance(fusion_result, tuple):
+                x, evidence_aux = fusion_result
+                if aux_dict is None:
+                    aux_dict = {}
+                aux_dict['evidence_aux'] = evidence_aux
+            else:
+                x = fusion_result
         else:
             # 如果没有融合层，只使用单一模态特征
             assert len(features) == 1, features
@@ -643,6 +650,13 @@ class BEVFusionWithRadar(BEVFusion):
         radar_middle_encoder: Optional[dict] = None,
         radar_velocity_encoder: Optional[dict] = None,
         velocity_refinement: Optional[dict] = None,
+        enable_evidence_loss: bool = True,
+        evi_loss_weight: float = 0.1,
+        evi_lambda_bg: float = 0.05,
+        evi_pos_weight: float = 10.0,
+        evi_kl_weight: float = 0.1,
+        evi_warmup_iters: int = 1000,
+        evi_kl_annealing_epochs: int = 6,
         **kwargs,
     ) -> None:
         """
@@ -673,6 +687,20 @@ class BEVFusionWithRadar(BEVFusion):
         
         # 调用父类初始化
         super().__init__(**kwargs)
+
+        # ============ 证据监督配置（分支级） ============
+        self.enable_evidence_loss = enable_evidence_loss
+        self.evi_loss_weight = evi_loss_weight
+        self.evi_lambda_bg = evi_lambda_bg
+        self.evi_pos_weight = evi_pos_weight
+        self.evi_kl_weight = evi_kl_weight
+        self.evi_warmup_iters = evi_warmup_iters
+        self.evi_kl_annealing_epochs = evi_kl_annealing_epochs
+        # 持久化 evidence warmup 计数，避免每次 resume 都重新 warmup。
+        self.register_buffer(
+            '_evi_step_buffer', torch.zeros((), dtype=torch.long), persistent=True)
+        self._evi_epoch = 0
+        self._evidence_aux = None
         
         # ============ 雷达分支初始化 ============
         self.radar_voxel_encoder = None
@@ -728,6 +756,73 @@ class BEVFusionWithRadar(BEVFusion):
     def with_velocity_refinement(self) -> bool:
         """bool: 检测器是否有速度校准模块"""
         return self.velocity_refinement is not None
+
+    @property
+    def _evi_step(self) -> int:
+        return int(self._evi_step_buffer.item())
+
+    @_evi_step.setter
+    def _evi_step(self, value: int) -> None:
+        self._evi_step_buffer.fill_(int(value))
+
+    def sync_resume_state(self, runner_iter: int) -> Dict[str, int]:
+        """在旧 checkpoint 缺失自定义 step 状态时，用全局 iter 回填。"""
+        synced = {}
+        runner_iter = max(int(runner_iter), 0)
+        if runner_iter <= 0:
+            return synced
+
+        if self.evi_warmup_iters > 0 and self._evi_step < runner_iter:
+            self._evi_step = runner_iter
+            synced['evi_step'] = self._evi_step
+
+        fusion_layer = getattr(self, 'fusion_layer', None)
+        if fusion_layer is not None and hasattr(fusion_layer, 'sync_resume_state'):
+            synced.update(fusion_layer.sync_resume_state(runner_iter))
+
+        return synced
+
+    def _infer_batch_size(self, batch_inputs_dict: Dict) -> int:
+        """根据输入字典推断 batch_size。"""
+        if 'points' in batch_inputs_dict:
+            return len(batch_inputs_dict['points'])
+        if 'imgs' in batch_inputs_dict:
+            return batch_inputs_dict['imgs'].shape[0]
+        return 1
+
+    def _build_empty_radar_velocity_bev(self, batch_size: int, device) -> Tensor:
+        """构建空雷达速度 BEV 图，保持输出形状稳定。"""
+        out_channels = getattr(self.radar_velocity_encoder, 'output_channels', 4)
+        return torch.zeros(
+            batch_size, out_channels, 180, 180,
+            dtype=torch.float32, device=device
+        )
+
+    def _build_empty_radar_feat(self, batch_size: int, device) -> Tensor:
+        """构建空雷达语义 BEV 特征，保持融合输入维度稳定。"""
+        out_channels = self.radar_middle_encoder.in_channels
+        ny = self.radar_middle_encoder.ny
+        nx = self.radar_middle_encoder.nx
+        return torch.zeros(
+            batch_size, out_channels, ny, nx,
+            dtype=torch.float32, device=device
+        )
+
+    def _inject_bbox_head_runtime_context(self) -> None:
+        """向检测头注入雷达运行时上下文。"""
+        if hasattr(self.bbox_head, 'set_radar_velocity_bev'):
+            self.bbox_head.set_radar_velocity_bev(self._radar_velocity_bev)
+
+        if hasattr(self.bbox_head, 'set_bev_world_meta'):
+            pcr = self._get_point_cloud_range()
+            cfg = self.bbox_head.train_cfg if self.bbox_head.train_cfg is not None else self.bbox_head.test_cfg
+            voxel_size = cfg.get('voxel_size', [0.075, 0.075, 0.2]) if cfg is not None else [0.075, 0.075, 0.2]
+            out_size_factor = cfg.get('out_size_factor', 8) if cfg is not None else 8
+            self.bbox_head.set_bev_world_meta(pcr, voxel_size, out_size_factor)
+
+        if hasattr(self.bbox_head, 'set_velocity_refinement_module'):
+            self.bbox_head.set_velocity_refinement_module(
+                self.velocity_refinement if self.with_velocity_refinement else None)
     
     def extract_radar_velocity_bev(self, batch_inputs_dict: Dict) -> Optional[Tensor]:
         """
@@ -749,21 +844,11 @@ class BEVFusionWithRadar(BEVFusion):
         
         radar_points = batch_inputs_dict.get('radar_points', None)
         
-        # 获取 batch_size
-        if 'points' in batch_inputs_dict:
-            batch_size = len(batch_inputs_dict['points'])
-        elif 'imgs' in batch_inputs_dict:
-            batch_size = batch_inputs_dict['imgs'].shape[0]
-        else:
-            batch_size = 1
+        batch_size = self._infer_batch_size(batch_inputs_dict)
         
         if radar_points is None or len(radar_points) == 0:
-            # 返回零填充的速度BEV图
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            return torch.zeros(
-                batch_size, 3, 180, 180,  # 默认 BEV 尺寸
-                dtype=torch.float32, device=device
-            )
+            return self._build_empty_radar_velocity_bev(batch_size, device)
         
         return self.radar_velocity_encoder(radar_points, batch_size)
     
@@ -858,24 +943,11 @@ class BEVFusionWithRadar(BEVFusion):
         
         radar_points = batch_inputs_dict.get('radar_points', None)
         
-        # 获取 batch_size（从 points 或其他输入推断）
-        if 'points' in batch_inputs_dict:
-            batch_size = len(batch_inputs_dict['points'])
-        elif 'imgs' in batch_inputs_dict:
-            batch_size = batch_inputs_dict['imgs'].shape[0]
-        else:
-            batch_size = 1
+        batch_size = self._infer_batch_size(batch_inputs_dict)
         
-        # 如果没有雷达点云或雷达点云为空，返回零填充的BEV特征
         if radar_points is None or len(radar_points) == 0:
-            out_channels = self.radar_middle_encoder.in_channels
-            ny = self.radar_middle_encoder.ny
-            nx = self.radar_middle_encoder.nx
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            return torch.zeros(
-                batch_size, out_channels, ny, nx,
-                dtype=torch.float32, device=device
-            )
+            return self._build_empty_radar_feat(batch_size, device)
         
         # 关闭自动混合精度，使用float32保证体素化的数值精度
         with torch.autocast('cuda', enabled=False):
@@ -885,26 +957,15 @@ class BEVFusionWithRadar(BEVFusion):
             total_points = sum(p.shape[0] for p in radar_points)
             
             if total_points == 0:
-                # 雷达点云为空，返回零填充的BEV特征
-                # 获取batch_size
                 batch_size = len(radar_points)
-                # 获取输出形状
-                out_channels = self.radar_middle_encoder.in_channels
-                ny = self.radar_middle_encoder.ny
-                nx = self.radar_middle_encoder.nx
-                # 获取设备
                 device = radar_points[0].device if len(radar_points) > 0 else 'cuda'
-                # 返回零填充的BEV特征
-                return torch.zeros(
-                    batch_size, out_channels, ny, nx,
-                    dtype=torch.float32, device=device
-                )
+                return self._build_empty_radar_feat(batch_size, device)
             
             # 体素化雷达点云
             feats, coords, sizes = self.radar_voxelize(radar_points)
             
-            # 从坐标中获取batch_size
-            batch_size = coords[-1, 0].item() + 1
+            # 使用前面推断的batch_size，不要从coords获取，防止最后一个点云为空时出错
+            # batch_size = coords[-1, 0].item() + 1
         
         # 通过PillarFeatureNet编码体素特征
         # PillarFeatureNet输入: (voxels, num_points, coors)
@@ -915,6 +976,20 @@ class BEVFusionWithRadar(BEVFusion):
         # 输入: (voxel_features, coors, batch_size)
         # 输出: BEV特征 [B, C, H, W]
         radar_bev_feat = self.radar_middle_encoder(pillar_features, coords, batch_size)
+        
+        # === 雷达区域概率扩张 (Radius Dilation) ===
+        # 使用 3x3 avg_pool 把单像素扩张为面特征
+        # avg_pool 保留激活幅度的相对大小，避免 max_pool 将所有非零区域拉到同一峰值
+        # kernel=3 对应 0.6m×3=1.8m，匹配雷达典型测距误差
+        import torch.nn.functional as F
+        if radar_bev_feat is not None:
+            radar_bev_feat = F.avg_pool2d(
+                radar_bev_feat, 
+                kernel_size=3,
+                stride=1, 
+                padding=1
+            )
+        # ============================================
         
         return radar_bev_feat
     
@@ -951,6 +1026,7 @@ class BEVFusionWithRadar(BEVFusion):
         imgs = batch_inputs_dict.get('imgs', None)
         points = batch_inputs_dict.get('points', None)
         features = []
+        aux_dict = {}
         
         # ============ 图像分支处理 ============
         if imgs is not None:
@@ -980,6 +1056,10 @@ class BEVFusionWithRadar(BEVFusion):
                                                 camera2lidar, img_aug_matrix,
                                                 lidar_aug_matrix,
                                                 batch_input_metas)
+            if isinstance(img_feature, tuple):
+                img_feature, img_aux = img_feature
+                if img_aux is not None:
+                    aux_dict.update(img_aux)
             features.append(img_feature)
         
         # ============ 点云分支处理 ============
@@ -1002,7 +1082,12 @@ class BEVFusionWithRadar(BEVFusion):
 
         # ============ 多模态特征融合 ============
         if self.fusion_layer is not None:
-            x = self.fusion_layer(features)
+            fusion_result = self.fusion_layer(features)
+            if isinstance(fusion_result, tuple):
+                x, evidence_aux = fusion_result
+                aux_dict['evidence_aux'] = evidence_aux
+            else:
+                x = fusion_result
         else:
             assert len(features) == 1, features
             x = features[0]
@@ -1011,7 +1096,203 @@ class BEVFusionWithRadar(BEVFusion):
         x = self.pts_backbone(x)
         x = self.pts_neck(x)
 
+        if aux_dict:
+            return x, aux_dict
         return x
+
+    def _get_point_cloud_range(self) -> List[float]:
+        """获取 BEV 目标构建所需的点云范围。"""
+        default_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+        if hasattr(self.bbox_head, 'train_cfg') and self.bbox_head.train_cfg is not None:
+            pcr = self.bbox_head.train_cfg.get('point_cloud_range', None)
+            if pcr is not None:
+                return list(pcr)
+
+        if hasattr(self.pts_voxel_layer, 'point_cloud_range'):
+            pcr = self.pts_voxel_layer.point_cloud_range
+            if isinstance(pcr, (list, tuple)):
+                return list(pcr)
+            if hasattr(pcr, 'tolist'):
+                return list(pcr.tolist())
+
+        return default_range
+
+    def _build_bev_occ_target(self, batch_data_samples: List[Det3DDataSample],
+                              H: int, W: int, device: torch.device,
+                              dtype: torch.dtype) -> Tensor:
+        """将 GT 3D 框投影到 BEV 网格，生成占用监督目标。"""
+        point_cloud_range = self._get_point_cloud_range()
+        x_min, y_min, _, x_max, y_max, _ = point_cloud_range
+        x_span = max(x_max - x_min, 1e-6)
+        y_span = max(y_max - y_min, 1e-6)
+
+        target = torch.zeros(
+            (len(batch_data_samples), 1, H, W),
+            device=device,
+            dtype=dtype,
+        )
+
+        for b, sample in enumerate(batch_data_samples):
+            if not hasattr(sample, 'gt_instances_3d'):
+                continue
+            gt_instances_3d = sample.gt_instances_3d
+            if not hasattr(gt_instances_3d, 'bboxes_3d'):
+                continue
+
+            boxes_tensor = gt_instances_3d.bboxes_3d.tensor
+            if boxes_tensor.numel() == 0:
+                continue
+
+            centers_x = boxes_tensor[:, 0]
+            centers_y = boxes_tensor[:, 1]
+            widths = boxes_tensor[:, 3]
+            lengths = boxes_tensor[:, 4]
+
+            x_center = ((centers_x - x_min) / x_span * W).long()
+            y_center = ((centers_y - y_min) / y_span * H).long()
+            half_w = torch.clamp((widths / x_span * W * 0.5).long(), min=1)
+            half_l = torch.clamp((lengths / y_span * H * 0.5).long(), min=1)
+
+            for i in range(boxes_tensor.shape[0]):
+                xc = x_center[i].item()
+                yc = y_center[i].item()
+                if xc < 0 or xc >= W or yc < 0 or yc >= H:
+                    continue
+                x0 = max(0, xc - half_w[i].item())
+                x1 = min(W, xc + half_w[i].item() + 1)
+                y0 = max(0, yc - half_l[i].item())
+                y1 = min(H, yc + half_l[i].item() + 1)
+                target[b, 0, y0:y1, x0:x1] = 1.0
+
+        return target
+
+    def _compute_evidential_losses(self, evidence_aux: Dict,
+                                   batch_data_samples: List[Det3DDataSample]) -> Dict[str, Tensor]:
+        """计算三分支证据损失与统计量。
+        
+        相比原始实现的改进：
+        1. 前景/背景平衡 MSE：用 evi_pos_weight 对前景像素加权，
+           解决 97:3 的极端类别不平衡问题
+        2. KL 散度正则化：惩罚"预测错误但证据很高"的情况，
+           迫使网络在不确定时输出低证据值
+        3. KL Annealing：KL 项权重随训练进度逐渐增大，
+           前期让网络自由学习特征，后期收紧约束
+        4. Modality Dropout 感知：被 dropout 的分支不计算拟合损失，
+           但仍计算 KL 损失（强迫被致盲的分支输出低证据）
+        """
+        losses = {}
+        evidence_maps = evidence_aux.get('evidence_maps', [])
+        belief_maps = evidence_aux.get('belief_maps', [])
+        uncertainty_maps = evidence_aux.get('uncertainty_maps', [])
+        fusion_weights = evidence_aux.get('fusion_weights', [])
+        dropped_branch = evidence_aux.get('dropped_branch', None)
+
+        branch_names = ['img', 'lidar', 'radar']
+        if len(evidence_maps) < 3 or len(belief_maps) < 3:
+            return losses
+
+        H, W = evidence_maps[0].shape[-2:]
+        target_occ = self._build_bev_occ_target(
+            batch_data_samples, H, W,
+            evidence_maps[0].device, evidence_maps[0].dtype,
+        )
+        losses['mean_occ_ratio'] = target_occ.detach().mean()
+
+        # ---- 全局 Warmup（控制整体证据损失的权重） ----
+        self._evi_step += 1
+        if self.evi_warmup_iters > 0:
+            warmup = min(1.0, float(self._evi_step) / float(self.evi_warmup_iters))
+        else:
+            warmup = 1.0
+
+        # ---- KL Annealing（KL 项逐 epoch 增强） ----
+        if self.evi_kl_annealing_epochs > 0:
+            kl_anneal = min(1.0, float(self._evi_epoch) / float(self.evi_kl_annealing_epochs))
+        else:
+            kl_anneal = 1.0
+
+        # ---- 预计算前景/背景 mask ----
+        pos_mask = (target_occ > 0.5).float()
+        neg_mask = 1.0 - pos_mask
+        pos_count = pos_mask.sum().clamp(min=1.0)
+        neg_count = neg_mask.sum().clamp(min=1.0)
+
+        evi_total = torch.tensor(0.0, device=evidence_maps[0].device,
+                                 dtype=evidence_maps[0].dtype)
+
+        for idx, name in enumerate(branch_names):
+            e_map = evidence_maps[idx]
+            b_map = belief_maps[idx]
+
+            is_dropped = (dropped_branch is not None and dropped_branch == idx)
+
+            # ==== 1. 前景/背景平衡 MSE Loss ====
+            # 前景像素少（~3%），需要更大的权重才能与背景平衡
+            if is_dropped:
+                # 被 dropout 的分支：不计算拟合损失
+                # 其特征全为零，evidence 应该自然趋近于零
+                loss_fit = torch.tensor(0.0, device=e_map.device, dtype=e_map.dtype)
+            else:
+                sq_err = (b_map - target_occ) ** 2
+                loss_pos = (sq_err * pos_mask).sum() / pos_count
+                loss_neg = (sq_err * neg_mask).sum() / neg_count
+                loss_fit = loss_pos * self.evi_pos_weight + loss_neg
+
+            # ==== 2. 背景证据抑制 ====
+            # 在背景区域应抑制证据值，防止虚假自信
+            loss_bg = (e_map * neg_mask).sum() / neg_count
+
+            # ==== 3. KL 散度正则化 ====
+            # 当 GT=0（背景）但 evidence 高时惩罚
+            # 当 GT=1（前景）但 evidence 低时由 MSE 处理
+            # 公式简化：KL[Dir(alpha_tilde) || Dir(1)]
+            #   对于被 dropout 的分支，额外强制其 evidence→0
+            if is_dropped:
+                # 被致盲分支的全部 evidence 应为 0
+                loss_kl = e_map.mean()
+            else:
+                # 只惩罚背景区域的错误自信
+                loss_kl = (e_map * neg_mask).sum() / neg_count
+
+            branch_loss = (loss_fit
+                           + self.evi_lambda_bg * loss_bg
+                           + self.evi_kl_weight * kl_anneal * loss_kl)
+
+            # 注意：键名不能包含 'loss'，否则 parse_losses 会将其计入总损失，
+            # 导致与 loss_evi_total 双重计数。这里仅用于日志记录。
+            losses[f'evi_raw_{name}'] = branch_loss.detach()
+            evi_total = evi_total + branch_loss
+
+            # 可解释统计：不参与梯度
+            losses[f'mean_e_{name}'] = e_map.detach().mean()
+            losses[f'mean_b_{name}'] = b_map.detach().mean()
+            if idx < len(uncertainty_maps):
+                losses[f'mean_u_{name}'] = uncertainty_maps[idx].detach().mean()
+            if idx < len(fusion_weights):
+                losses[f'mean_w_{name}'] = fusion_weights[idx].detach().mean()
+
+        if len(uncertainty_maps) > 0:
+            all_u = torch.stack([u.detach().mean() for u in uncertainty_maps])
+            losses['mean_u_all'] = all_u.mean()
+
+        losses['loss_evi_total'] = self.evi_loss_weight * warmup * evi_total
+        losses['evi_warmup'] = torch.tensor(
+            warmup, device=evidence_maps[0].device, dtype=evidence_maps[0].dtype)
+        losses['evi_kl_anneal'] = torch.tensor(
+            kl_anneal, device=evidence_maps[0].device, dtype=evidence_maps[0].dtype)
+
+        # 记录融合渐进恢复的混合比例
+        fusion_blend = evidence_aux.get('fusion_blend', 1.0)
+        losses['fusion_blend'] = torch.tensor(
+            fusion_blend, device=evidence_maps[0].device,
+            dtype=evidence_maps[0].dtype)
+        for stat_name in ['radar_gate', 'radar_warmup', 'radar_effective_gate']:
+            if stat_name in evidence_aux:
+                losses[stat_name] = torch.tensor(
+                    float(evidence_aux[stat_name]),
+                    device=evidence_maps[0].device,
+                    dtype=evidence_maps[0].dtype)
+        return losses
     
     def predict(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
                 batch_data_samples: List[Det3DDataSample],
@@ -1027,12 +1308,14 @@ class BEVFusionWithRadar(BEVFusion):
             list[Det3DDataSample]: 检测结果列表
         """
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        result = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        if isinstance(result, tuple):
+            feats = result[0]
+        else:
+            feats = result
 
         if self.with_bbox_head:
-            # 传递雷达速度BEV图给检测头
-            if hasattr(self.bbox_head, 'set_radar_velocity_bev'):
-                self.bbox_head.set_radar_velocity_bev(self._radar_velocity_bev)
+            self._inject_bbox_head_runtime_context()
             outputs = self.bbox_head.predict(feats, batch_input_metas)
 
         res = self.add_pred_to_datasample(batch_data_samples, outputs)
@@ -1052,14 +1335,23 @@ class BEVFusionWithRadar(BEVFusion):
             dict: 损失字典
         """
         batch_input_metas = [item.metainfo for item in batch_data_samples]
-        feats = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        result = self.extract_feat(batch_inputs_dict, batch_input_metas)
+        if isinstance(result, tuple):
+            feats, aux_dict = result
+        else:
+            feats = result
+            aux_dict = {}
 
         losses = dict()
         if self.with_bbox_head:
-            # 传递雷达速度BEV图给检测头
-            if hasattr(self.bbox_head, 'set_radar_velocity_bev'):
-                self.bbox_head.set_radar_velocity_bev(self._radar_velocity_bev)
+            self._inject_bbox_head_runtime_context()
             bbox_loss = self.bbox_head.loss(feats, batch_data_samples)
 
         losses.update(bbox_loss)
+
+        if self.enable_evidence_loss and 'evidence_aux' in aux_dict:
+            evidence_loss = self._compute_evidential_losses(
+                aux_dict['evidence_aux'], batch_data_samples)
+            losses.update(evidence_loss)
+
         return losses

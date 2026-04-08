@@ -21,11 +21,16 @@ class CBGSDataset:
         dataset (:obj:`BaseDataset` or dict): The dataset to be class sampled.
         lazy_init (bool): Whether to load annotation during instantiation.
             Defaults to False.
+        weather_resampling_ratios (dict, optional): Extra weather-based
+            resampling multipliers applied on top of CBGS. Defaults to
+            ``dict(day=1, night=2, rain=3)`` to preserve the current
+            repository behavior.
     """
 
     def __init__(self,
                  dataset: Union[BaseDataset, dict],
-                 lazy_init: bool = False) -> None:
+                 lazy_init: bool = False,
+                 weather_resampling_ratios: Union[dict, None] = None) -> None:
         self.dataset: BaseDataset
         if isinstance(dataset, dict):
             self.dataset = DATASETS.build(dataset)
@@ -36,6 +41,10 @@ class CBGSDataset:
                 'elements in datasets sequence should be config or '
                 f'`BaseDataset` instance, but got {type(dataset)}')
         self._metainfo = self.dataset.metainfo
+        default_weather_ratios = dict(day=1, night=2, rain=3)
+        if weather_resampling_ratios is not None:
+            default_weather_ratios.update(weather_resampling_ratios)
+        self.weather_resampling_ratios = default_weather_ratios
 
         self._fully_initialized = False
         if not lazy_init:
@@ -91,10 +100,47 @@ class CBGSDataset:
 
         frac = 1.0 / len(classes)
         ratios = [frac / v for v in class_distribution.values()]
+
+        # Build token to weather description map
+        token2desc = {}
+        try:
+            import json
+            import os.path as osp
+            data_root = 'data/nuscenes'
+            sample_json_path = osp.join(data_root, 'v1.0-trainval', 'sample.json')
+            scene_json_path = osp.join(data_root, 'v1.0-trainval', 'scene.json')
+            if osp.exists(sample_json_path) and osp.exists(scene_json_path):
+                with open(sample_json_path, 'r') as f:
+                    samples = json.load(f)
+                with open(scene_json_path, 'r') as f:
+                    scenes = json.load(f)
+                scene_token2desc = {scene['token']: scene['description'].lower() for scene in scenes}
+                for sample in samples:
+                    token2desc[sample['token']] = scene_token2desc.get(sample['scene_token'], '')
+        except Exception as e:
+            print(f"Warning: Failed to load weather info. Reason: {e}")
+
+        # Apply CBGS ratios first
         for cls_inds, ratio in zip(list(class_sample_idxs.values()), ratios):
-            sample_indices += np.random.choice(cls_inds,
-                                               int(len(cls_inds) *
-                                                   ratio)).tolist()
+            base_sample_count = int(len(cls_inds) * ratio)
+            sampled_idxs = np.random.choice(cls_inds, base_sample_count).tolist()
+            
+            # Apply weather oversampling on top of the sampled indices
+            for idx in sampled_idxs:
+                info = dataset.get_data_info(idx)
+                
+                token = info.get('token', '')
+                scene_desc = token2desc.get(token, '')
+                
+                if 'rain' in scene_desc:
+                    multiplier = self.weather_resampling_ratios['rain']
+                elif 'night' in scene_desc:
+                    multiplier = self.weather_resampling_ratios['night']
+                else:
+                    multiplier = self.weather_resampling_ratios['day']
+                    
+                sample_indices.extend([idx] * multiplier)
+                
         return sample_indices
 
     @force_full_init

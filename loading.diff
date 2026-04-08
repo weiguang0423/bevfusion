@@ -1,0 +1,208 @@
+diff --git a/projects/BEVFusion/bevfusion/loading.py b/projects/BEVFusion/bevfusion/loading.py
+index 774e698..c8b3e36 100755
+--- a/projects/BEVFusion/bevfusion/loading.py
++++ b/projects/BEVFusion/bevfusion/loading.py
+@@ -21,6 +21,7 @@ from typing import List, Optional, Union
+ import mmcv
+ import mmengine
+ import numpy as np
++import os
+ from mmcv.transforms.base import BaseTransform
+ from mmengine.fileio import get
+ 
+@@ -404,6 +405,30 @@ class LoadRadarPointsFromFile(BaseTransform):
+             warnings.warn(f'Failed to load radar points from {pts_filename}: {e}')
+             return np.zeros((0, self.load_dim), dtype=np.float32)
+ 
++    @staticmethod
++    def _rotate_xy_velocity(points: np.ndarray, start_idx: int,
++                            rotation_t: np.ndarray) -> None:
++        """在给定起始列上对二维速度做旋转（只旋转不平移）。"""
++        velocity = np.zeros((points.shape[0], 3), dtype=np.float32)
++        velocity[:, :2] = points[:, start_idx:start_idx + 2]
++        velocity = velocity @ rotation_t
++        points[:, start_idx:start_idx + 2] = velocity[:, :2]
++
++    def _transform_points_to_lidar(self, points: np.ndarray,
++                                   radar2lidar: np.ndarray) -> np.ndarray:
++        """将雷达坐标系点与速度变换到 LiDAR 坐标系。"""
++        points_homo = np.ones((points.shape[0], 4), dtype=np.float32)
++        points_homo[:, :3] = points[:, :3]
++        points_transformed = points_homo @ radar2lidar.T
++        points[:, :3] = points_transformed[:, :3]
++
++        if self.load_dim >= 10:
++            rotation_t = radar2lidar[:3, :3].T
++            self._rotate_xy_velocity(points, start_idx=6, rotation_t=rotation_t)
++            self._rotate_xy_velocity(points, start_idx=8, rotation_t=rotation_t)
++
++        return points
++
+     def transform(self, results: dict) -> dict:
+         """
+         加载雷达点云并添加到results字典
+@@ -431,10 +456,10 @@ class LoadRadarPointsFromFile(BaseTransform):
+             warnings.warn('radar_info not found in results, '
+                          'returning empty radar points')
+             points_class = get_points_type(self.coord_type)
+-            empty_points = np.zeros((0, len(self.use_dim)), dtype=np.float32)
++            empty_points = np.zeros((0, len(self.use_dim) + 1), dtype=np.float32)
+             results['radar_points'] = points_class(
+                 empty_points,
+-                points_dim=len(self.use_dim),
++                points_dim=points.shape[-1],
+                 attribute_dims=None)
+             return results
+         
+@@ -444,7 +469,7 @@ class LoadRadarPointsFromFile(BaseTransform):
+         all_radar_points = []
+         
+         # 遍历所有雷达传感器
+-        for sensor_name, sensor_info in radar_info.items():
++        for _, sensor_info in radar_info.items():
+             if 'radar_path' not in sensor_info:
+                 continue
+                 
+@@ -461,27 +486,7 @@ class LoadRadarPointsFromFile(BaseTransform):
+                 # 获取雷达到LiDAR的变换矩阵
+                 if 'radar2lidar' in sensor_info:
+                     radar2lidar = np.array(sensor_info['radar2lidar']).astype(np.float32)
+-                    # 应用坐标变换：将雷达点从传感器坐标系转换到LiDAR坐标系
+-                    # 变换公式: p_lidar = (R @ p_radar^T + t)^T = p_radar @ R^T + t^T
+-                    points_homo = np.ones((points.shape[0], 4), dtype=np.float32)
+-                    points_homo[:, :3] = points[:, :3]
+-                    points_transformed = points_homo @ radar2lidar.T
+-                    points[:, :3] = points_transformed[:, :3]
+-                    
+-                    # 如果有速度信息，也需要变换（只旋转，不平移）
+-                    # vx, vy 在索引 6, 7；vx_comp, vy_comp 在索引 8, 9
+-                    if self.load_dim >= 10:
+-                        # 变换原始速度
+-                        velocity = np.zeros((points.shape[0], 3))
+-                        velocity[:, :2] = points[:, 6:8]
+-                        velocity = velocity @ radar2lidar[:3, :3].T
+-                        points[:, 6:8] = velocity[:, :2]
+-                        
+-                        # 变换补偿后速度
+-                        velocity_comp = np.zeros((points.shape[0], 3))
+-                        velocity_comp[:, :2] = points[:, 8:10]
+-                        velocity_comp = velocity_comp @ radar2lidar[:3, :3].T
+-                        points[:, 8:10] = velocity_comp[:, :2]
++                    points = self._transform_points_to_lidar(points, radar2lidar)
+                 
+                 all_radar_points.append(points)
+                 
+@@ -599,10 +604,19 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
+             np.ndarray: 点云数据数组
+                 An array containing point clouds data.
+         """
++        # nuScenes 雷达 sweep 是 .pcd，必须使用 RadarPointCloud 解析
++        if pts_filename.endswith('.pcd'):
++            from nuscenes.utils.data_classes import RadarPointCloud
++            try:
++                pc = RadarPointCloud.from_file(pts_filename)
++                return pc.points.T.astype(np.float32)
++            except Exception as e:
++                warnings.warn(f'Failed to load radar sweep from {pts_filename}: {e}')
++                return np.zeros((0, self.load_dim), dtype=np.float32)
++
+         try:
+             pts_bytes = get(pts_filename, backend_args=self.backend_args)
+             points = np.frombuffer(pts_bytes, dtype=np.float32)
+-            # np.frombuffer返回只读数组，需要复制一份可写的
+             points = np.copy(points)
+         except ConnectionError:
+             mmengine.check_file_exist(pts_filename)
+@@ -610,7 +624,23 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
+                 points = np.load(pts_filename)
+             else:
+                 points = np.fromfile(pts_filename, dtype=np.float32)
+-        return points
++
++        if points.ndim == 1:
++            if points.size == 0:
++                return np.zeros((0, self.load_dim), dtype=np.float32)
++            if points.size % self.load_dim != 0:
++                warnings.warn(
++                    f'Invalid radar sweep data length {points.size} for '
++                    f'load_dim={self.load_dim}, file={pts_filename}')
++                return np.zeros((0, self.load_dim), dtype=np.float32)
++            points = points.reshape(-1, self.load_dim)
++        elif points.ndim == 2 and points.shape[1] != self.load_dim:
++            warnings.warn(
++                f'Invalid radar sweep shape {points.shape}, expected second '
++                f'dim={self.load_dim}, file={pts_filename}')
++            return np.zeros((0, self.load_dim), dtype=np.float32)
++
++        return points.astype(np.float32, copy=False)
+ 
+     def _remove_close(
+         self,
+@@ -696,7 +726,11 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
+         # 创建新的点云对象（维度 +1）
+         import torch
+         current_points_tensor = torch.from_numpy(current_points_with_dt).to(points.tensor.device)
+-        points_with_dt = points.new_point(current_points_tensor)
++        points_class = type(points)
++        points_with_dt = points_class(
++            current_points_tensor,
++            points_dim=current_dim + 1,
++            attribute_dims=None)
+         
+         sweep_points_list = [points_with_dt]
+         
+@@ -751,7 +785,6 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
+                     try:
+                         # 加载雷达点云
+                         points_sweep = self._load_points(sensor_info['radar_path'])
+-                        points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
+                         
+                         if points_sweep.shape[0] == 0:
+                             continue
+@@ -803,7 +836,11 @@ class LoadRadarPointsFromMultiSweeps(BaseTransform):
+                 # 创建点云对象（维度 +1）
+                 import torch
+                 points_sweep_tensor = torch.from_numpy(points_sweep_with_dt).to(points.tensor.device)
+-                points_sweep_obj = points_with_dt.new_point(points_sweep_tensor)
++                points_class = type(points_with_dt)
++                points_sweep_obj = points_class(
++                    points_sweep_tensor,
++                    points_dim=points_with_dt.points_dim,
++                    attribute_dims=None)
+                 sweep_points_list.append(points_sweep_obj)
+         
+         # 拼接所有帧的点云
+@@ -1040,3 +1077,33 @@ class LoadDepthFromPoints(BaseTransform):
+         repr_str += f'discretization={self.discretization}, '
+         repr_str += f'dilation_kernel={self.dilation_kernel})'
+         return repr_str
++
++@TRANSFORMS.register_module()
++class LoadPreprocessedRadarPoints(BaseTransform):
++    def __init__(self, data_root='data/nuscenes', preprocessed_dir='radar_multisweep_preprocessed', use_dim=[0, 1, 2, 5, 8, 9, 16, 17], coord_type='LIDAR'):
++        import os
++        self.dir_path = os.path.join(data_root, preprocessed_dir)
++        self.use_dim = use_dim
++        self.coord_type = coord_type
++
++    def transform(self, results: dict) -> dict:
++        import numpy as np
++        import os
++        import warnings
++        from mmdet3d.structures.points import get_points_type
++        
++        token = results['token']
++        file_path = os.path.join(self.dir_path, f"{token}.npy")
++        
++        points_class = get_points_type(self.coord_type)
++        if not os.path.exists(file_path):
++            warnings.warn(f"Preprocessed radar points not found: {file_path}, returning empty")
++            points = np.zeros((0, len(self.use_dim) + 1), dtype=np.float32)
++        else:
++            points = np.load(file_path)
++            
++        results['radar_points'] = points_class(
++            points,
++            points_dim=points.shape[-1],
++            attribute_dims=None)
++        return results

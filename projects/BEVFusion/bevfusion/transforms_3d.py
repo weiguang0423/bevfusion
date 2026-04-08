@@ -432,6 +432,13 @@ class BEVFusionGlobalRotScaleTrans(GlobalRotScaleTrans):
         # 缩放雷达点云（使用相同的缩放因子）
         if 'radar_points' in input_dict:
             input_dict['radar_points'].scale(scale)
+            # BasePoints.scale() 只缩放 [:, :3]（坐标），
+            # 需要同步缩放速度分量 vx_comp(idx=4), vy_comp(idx=5)，
+            # 否则与GT bbox velocity 缩放不一致。
+            radar_tensor = input_dict['radar_points'].tensor
+            if radar_tensor.shape[1] > 5:
+                radar_tensor[:, 4] *= scale
+                radar_tensor[:, 5] *= scale
         
         # 缩放边界框
         if self.shift_height:

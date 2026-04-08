@@ -116,14 +116,29 @@ class SEConvFuser(nn.Module):
     
     融合策略：
     1. 对每个模态分支独立应用SE注意力
-    2. 拼接所有模态特征
-    3. 3x3卷积融合 -> BN -> ReLU
+    2. （可选）每个模态预测证据图，计算 belief/uncertainty
+    3. （可选）基于证据权重对分支特征做像素级加权
+    4. 拼接所有模态特征
+    5. 3x3卷积融合 -> BN -> ReLU
     
     Args:
         in_channels (list[int]): 输入特征通道数列表，如 [80, 256, 64]
         out_channels (int): 输出特征通道数
         reduction (int): SE模块的通道压缩比，默认4
         use_se (list[bool] | bool): 是否对每个模态使用SE，默认True
+        enable_evidence_fusion (bool): 是否启用证据引导融合权重
+        enable_evidence_heads (bool): 是否启用证据头（输出 evidence map）
+        return_evidence (bool): 是否返回 (fused_feat, evidence_aux)
+        evidence_eps (float): 数值稳定项
+        evidence_clamp_max (float): 证据值上限，防止极端值
+        branch_scale (list[float] | None): 模态级先验权重
+        learnable_branch_scale (bool): 是否让模态级先验权重可学习
+        modality_dropout_rate (float): 训练时随机置零某个模态的概率（0=禁用）
+        uncertainty_gate (bool): 是否对融合输出施加不确定性门控
+        fusion_warmup_iters (int): 融合权重渐进恢复的迭代数。
+            在前 fusion_warmup_iters 次训练 forward 中，融合权重从均匀
+            逐步过渡到证据加权，避免 evidence heads 尚未收敛时扰动检测。
+            0 = 不做渐进，直接使用证据权重。
     """
 
     def __init__(
@@ -131,17 +146,65 @@ class SEConvFuser(nn.Module):
         in_channels: List[int],
         out_channels: int,
         reduction: int = 4,
-        use_se: Union[List[bool], bool] = True
+        use_se: Union[List[bool], bool] = True,
+        enable_evidence_fusion: bool = False,
+        enable_evidence_heads: bool = False,
+        return_evidence: bool = False,
+        evidence_eps: float = 1e-6,
+        evidence_clamp_max: float = 50.0,
+        branch_scale: Union[List[float], None] = None,
+        learnable_branch_scale: bool = False,
+        modality_dropout_rate: float = 0.0,
+        uncertainty_gate: bool = False,
+        fusion_warmup_iters: int = 0,
+        residual_radar: bool = False,
+        radar_gate_init: float = 0.0,
+        radar_warmup_epochs: int = 0,
     ) -> None:
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.enable_evidence_fusion = enable_evidence_fusion
+        self.enable_evidence_heads = enable_evidence_heads
+        self.return_evidence = return_evidence
+        self.evidence_eps = evidence_eps
+        self.evidence_clamp_max = evidence_clamp_max
+        self.modality_dropout_rate = modality_dropout_rate
+        self.uncertainty_gate = uncertainty_gate
+        self.fusion_warmup_iters = fusion_warmup_iters
+        # 持久化 warmup 计数，确保 epoch-wise resume 后不会重新从 0 开始。
+        self.register_buffer(
+            '_fusion_step_buffer', torch.zeros((), dtype=torch.long), persistent=True)
+        
+        # ====== 残差雷达融合模式 ======
+        # 当 residual_radar=True 时：
+        #   - primary_conv 只融合前N-1个模态（cam+lidar），维度与2模态预训练一致
+        #   - radar_proj 处理最后一个模态（radar），投影到相同out_channels
+        #   - radar_gate 从 radar_gate_init 开始，控制radar贡献量
+        # 优势：预训练2模态权重可完美加载到primary_conv，radar从零贡献起步
+        self.residual_radar = residual_radar
+        self.radar_warmup_epochs = radar_warmup_epochs
+        # 用迭代计数实现warmup，不依赖外部hook
+        # 假设每epoch约9000 iters (batch_size=6, CBGS ~56k samples)
+        self._radar_warmup_total_iters = radar_warmup_epochs * 9000 if radar_warmup_epochs > 0 else 0
+        self.register_buffer(
+            '_radar_warmup_step_buffer', torch.zeros((), dtype=torch.long), persistent=True)
         
         # 处理use_se参数
         if isinstance(use_se, bool):
             use_se = [use_se] * len(in_channels)
         self.use_se = use_se
+
+        if branch_scale is None:
+            branch_scale = [1.0] * len(in_channels)
+        assert len(branch_scale) == len(in_channels), \
+            f'branch_scale length {len(branch_scale)} must match in_channels length {len(in_channels)}'
+        base_scale = torch.tensor(branch_scale, dtype=torch.float32)
+        if learnable_branch_scale:
+            self.branch_scale = nn.Parameter(base_scale)
+        else:
+            self.register_buffer('branch_scale', base_scale)
         
         # 为每个模态创建SE模块
         self.se_modules = nn.ModuleList()
@@ -150,14 +213,172 @@ class SEConvFuser(nn.Module):
                 self.se_modules.append(SEBlock(ch, reduction))
             else:
                 self.se_modules.append(nn.Identity())
+
+        # 每个模态一个证据头：Conv1x1 -> ReLU -> Conv1x1 -> Softplus
+        self.evidence_heads = nn.ModuleList()
+        for ch in in_channels:
+            hidden_ch = max(ch // 2, 8)
+            self.evidence_heads.append(
+                nn.Sequential(
+                    nn.Conv2d(ch, hidden_ch, kernel_size=1, bias=True),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(hidden_ch, 1, kernel_size=1, bias=True),
+                    nn.Softplus(),
+                ))
         
-        # 融合卷积
-        self.conv = nn.Conv2d(
-            sum(in_channels), out_channels, 3, padding=1, bias=False)
+        if self.residual_radar and len(in_channels) >= 3:
+            # 残差模式：primary处理cam+lidar, radar单独投影
+            primary_channels = sum(in_channels[:-1])  # 80 + 256 = 336
+            radar_channels = in_channels[-1]           # 64
+            
+            # primary_conv: 与2模态预训练的ConvFuser维度完全一致
+            self.primary_conv = nn.Conv2d(
+                primary_channels, out_channels, 3, padding=1, bias=False)
+            # radar_proj: 将radar BEV投影到相同维度
+            self.radar_proj = nn.Sequential(
+                nn.Conv2d(radar_channels, out_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, 1, bias=False),
+            )
+            # radar_gate: 可学习标量，初始为radar_gate_init（默认0）
+            self.radar_gate = nn.Parameter(
+                torch.tensor(radar_gate_init, dtype=torch.float32))
+            # conv 在残差模式下不使用，但保留以兼容state_dict结构
+            self.conv = nn.Conv2d(
+                sum(in_channels), out_channels, 3, padding=1, bias=False)
+            for param in self.conv.parameters():
+                param.requires_grad_(False)
+        else:
+            # 标准模式：所有模态拼接
+            self.conv = nn.Conv2d(
+                sum(in_channels), out_channels, 3, padding=1, bias=False)
+        
         self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+    @property
+    def _fusion_step(self) -> int:
+        return int(self._fusion_step_buffer.item())
+
+    @_fusion_step.setter
+    def _fusion_step(self, value: int) -> None:
+        self._fusion_step_buffer.fill_(int(value))
+
+    @property
+    def _radar_warmup_step(self) -> int:
+        return int(self._radar_warmup_step_buffer.item())
+
+    @_radar_warmup_step.setter
+    def _radar_warmup_step(self, value: int) -> None:
+        self._radar_warmup_step_buffer.fill_(int(value))
+
+    def sync_resume_state(self, runner_iter: int) -> dict:
+        """在旧 checkpoint 缺少持久化计数器时，用 runner.iter 回填状态。"""
+        synced = {}
+        runner_iter = max(int(runner_iter), 0)
+
+        if self.fusion_warmup_iters > 0 and self._fusion_step < runner_iter:
+            self._fusion_step = runner_iter
+            synced['fusion_step'] = self._fusion_step
+
+        if self._radar_warmup_total_iters > 0 and self._radar_warmup_step < runner_iter:
+            self._radar_warmup_step = runner_iter
+            synced['radar_warmup_step'] = self._radar_warmup_step
+
+        return synced
+
+    def _get_branch_scale(self, device: torch.device, dtype: torch.dtype,
+                          num_branches: int) -> torch.Tensor:
+        """获取并归一化模态级先验权重。"""
+        scale = self.branch_scale.to(device=device, dtype=dtype)
+        scale = torch.clamp(scale, min=0.0)
+        if float(scale.sum().item()) <= self.evidence_eps:
+            scale = scale.new_ones(num_branches)
+        scale = scale / (scale.sum() + self.evidence_eps)
+        return scale.view(1, num_branches, 1, 1)
+
+    def _compute_evidence_aux(self, inputs: List[torch.Tensor]) -> dict:
+        """计算每个模态的 evidence/belief/uncertainty。"""
+        evidence_maps = []
+        belief_maps = []
+        uncertainty_maps = []
+
+        for feat, head in zip(inputs, self.evidence_heads):
+            e_map = head(feat)
+            e_map = torch.clamp(e_map, min=0.0, max=self.evidence_clamp_max)
+
+            # Subjective logic (binary occupancy): alpha = e + 1
+            alpha = e_map + 1.0
+            b_map = e_map / (alpha + self.evidence_eps)
+            u_map = 1.0 / (alpha + self.evidence_eps)
+
+            evidence_maps.append(e_map)
+            belief_maps.append(b_map)
+            uncertainty_maps.append(u_map)
+
+        return {
+            'evidence_maps': evidence_maps,
+            'belief_maps': belief_maps,
+            'uncertainty_maps': uncertainty_maps,
+        }
+
+    def _apply_modality_dropout(
+        self, attended_inputs: List[torch.Tensor]
+    ) -> Tuple[List[torch.Tensor], Union[int, None]]:
+        """训练阶段随机致盲一个模态，增强融合鲁棒性。"""
+        dropout_mask = None
+        if self.training and self.modality_dropout_rate > 0:
+            if torch.rand(1).item() < self.modality_dropout_rate:
+                drop_idx = torch.randint(0, len(attended_inputs), (1,)).item()
+                attended_inputs = list(attended_inputs)
+                attended_inputs[drop_idx] = torch.zeros_like(attended_inputs[drop_idx])
+                dropout_mask = drop_idx
+        return attended_inputs, dropout_mask
+
+    def _compute_fusion_weights(
+        self,
+        attended_inputs: List[torch.Tensor],
+        evidence_aux: Union[dict, None],
+    ) -> Tuple[torch.Tensor, float]:
+        """计算证据融合权重；在 warmup 期间平滑过渡到 evidence-driven 权重。"""
+        first_feat = attended_inputs[0]
+        prior_scale = self._get_branch_scale(
+            first_feat.device, first_feat.dtype, len(attended_inputs))
+        h, w = first_feat.shape[-2:]
+        prior_weights = prior_scale.expand(first_feat.shape[0], -1, h, w)
+        blend = 1.0
+
+        if self.enable_evidence_fusion and evidence_aux is not None:
+            belief_stack = torch.cat(evidence_aux['belief_maps'], dim=1)
+            weighted_belief = belief_stack * prior_scale
+            denom = weighted_belief.sum(dim=1, keepdim=True) + self.evidence_eps
+            evi_weights = weighted_belief / denom
+
+            if self.training and self.fusion_warmup_iters > 0:
+                self._fusion_step += 1
+                blend = min(1.0, self._fusion_step / self.fusion_warmup_iters)
+
+            if blend < 1.0:
+                weights = blend * evi_weights + (1.0 - blend) * prior_weights
+            else:
+                weights = evi_weights
+        else:
+            weights = prior_weights
+
+        return weights, blend
+
+    def set_epoch(self, epoch: int):
+        """由训练hook调用，更新当前epoch用于radar warmup调度。"""
+        self._current_epoch = epoch
+
+    def _get_radar_warmup_factor(self) -> float:
+        """计算radar贡献的warmup系数，从0线性增到1。"""
+        if self._radar_warmup_total_iters <= 0:
+            return 1.0
+        return min(1.0, self._radar_warmup_step / max(self._radar_warmup_total_iters, 1))
+
+    def forward(self, inputs: List[torch.Tensor]) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
         融合多个输入特征
         
@@ -165,18 +386,129 @@ class SEConvFuser(nn.Module):
             inputs: 输入特征列表 [img_bev, lidar_bev, radar_bev]
             
         Returns:
-            融合后的特征
+            - return_evidence=False: 融合后的特征
+            - return_evidence=True: (融合后的特征, evidence_aux)
         """
+        assert len(inputs) == len(self.in_channels), \
+            f'Expected {len(self.in_channels)} inputs, got {len(inputs)}'
+
         # 对每个模态应用SE注意力
         attended_inputs = []
         for feat, se_module in zip(inputs, self.se_modules):
             attended_inputs.append(se_module(feat))
+
+        attended_inputs, dropout_mask = self._apply_modality_dropout(attended_inputs)
+
+        evidence_aux = None
+        if self.enable_evidence_heads:
+            evidence_aux = self._compute_evidence_aux(attended_inputs)
+            if dropout_mask is not None:
+                evidence_aux['dropped_branch'] = dropout_mask
+
+        weights, blend = self._compute_fusion_weights(attended_inputs, evidence_aux)
+        if evidence_aux is not None:
+            evidence_aux['fusion_blend'] = blend
+
+        # ====== 残差雷达融合路径 ======
+        if self.residual_radar and len(inputs) >= 3:
+            return self._forward_residual_radar(attended_inputs, weights, evidence_aux)
+
+        # ====== 以下为标准拼接融合路径 ======
+
+        weighted_inputs = []
+        for idx, feat in enumerate(attended_inputs):
+            weighted_inputs.append(feat * weights[:, idx:idx + 1])
         
-        # 拼接并融合
-        x = torch.cat(attended_inputs, dim=1)
+        x = torch.cat(weighted_inputs, dim=1)
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
+
+        if self.uncertainty_gate and evidence_aux is not None:
+            belief_maps = evidence_aux.get('belief_maps', [])
+            if len(belief_maps) > 0:
+                belief_stack_raw = torch.cat(belief_maps, dim=1)
+                gate = belief_stack_raw.max(dim=1, keepdim=True)[0]
+                gate = gate.clamp(min=0.01)
+                x = x * gate
+
+        if self.return_evidence:
+            if evidence_aux is None:
+                evidence_aux = {
+                    'evidence_maps': [],
+                    'belief_maps': [],
+                    'uncertainty_maps': [],
+                }
+            evidence_aux['fusion_weights'] = [weights[:, i:i + 1] for i in range(weights.shape[1])]
+            return x, evidence_aux
+
+        return x
+
+    def _forward_residual_radar(
+        self,
+        attended_inputs: List[torch.Tensor],
+        weights: torch.Tensor,
+        evidence_aux: Union[dict, None] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        """
+        残差雷达融合：cam+lidar走预训练路径，radar作为残差加入。
+        
+        output = BN(ReLU(primary_conv(cat(cam, lidar))
+                         + warmup * sigmoid(radar_gate) * radar_proj(radar)))
+        
+        radar_gate初始为0 → sigmoid(0)=0.5 * warmup(epoch0)=0 → 初始radar贡献为0。
+        随着训练推进，warmup增大 + radar_gate学习 → radar逐步贡献。
+        """
+        num_branches = weights.shape[1]
+
+        # 分离cam+lidar和radar，并保持均匀权重时与预训练尺度一致。
+        primary_inputs = []
+        for idx, feat in enumerate(attended_inputs[:-1]):
+            primary_scale = weights[:, idx:idx + 1] * num_branches
+            primary_inputs.append(feat * primary_scale)
+        radar_feat = attended_inputs[-1]
+        radar_scale = weights[:, -1:] * num_branches
+        
+        # 主路径：cam+lidar融合（与预训练一致）
+        primary_cat = torch.cat(primary_inputs, dim=1)
+        x_primary = self.primary_conv(primary_cat)
+        
+        # 雷达残差路径
+        x_radar = self.radar_proj(radar_feat) * radar_scale
+        
+        # 门控：sigmoid(radar_gate) * warmup_factor
+        gate = torch.sigmoid(self.radar_gate)
+        if self.training:
+            self._radar_warmup_step += 1
+        warmup = self._get_radar_warmup_factor()
+        effective_gate = gate * warmup
+        
+        # 残差融合
+        x = x_primary + effective_gate * x_radar
+        x = self.bn(x)
+        x = self.relu(x)
+
+        if self.uncertainty_gate and evidence_aux is not None:
+            belief_maps = evidence_aux.get('belief_maps', [])
+            if len(belief_maps) > 0:
+                belief_stack_raw = torch.cat(belief_maps, dim=1)
+                gate_map = belief_stack_raw.max(dim=1, keepdim=True)[0]
+                gate_map = gate_map.clamp(min=0.01)
+                x = x * gate_map
+
+        if self.return_evidence:
+            if evidence_aux is None:
+                evidence_aux = {
+                    'evidence_maps': [],
+                    'belief_maps': [],
+                    'uncertainty_maps': [],
+                }
+            evidence_aux['fusion_weights'] = [weights[:, i:i + 1] for i in range(weights.shape[1])]
+            evidence_aux['radar_gate'] = float(gate.detach().item())
+            evidence_aux['radar_warmup'] = warmup
+            evidence_aux['radar_effective_gate'] = float(effective_gate.detach().item())
+            return x, evidence_aux
+
         return x
 
 
@@ -426,7 +758,7 @@ class TransFusionHead(nn.Module):
         融合雷达速度和预测速度
         
         从雷达速度BEV图中采样对应位置的速度，
-        基于置信度进行加权融合。
+        基于RMS物理置信度进行加权融合。
         
         Args:
             pred_vel: 网络预测的速度 [B, 2, num_proposals]
@@ -448,18 +780,28 @@ class TransFusionHead(nn.Module):
         grid = grid.unsqueeze(2)  # [B, num_proposals, 1, 2]
         
         # 从雷达速度BEV图中采样
+        # velocity_bev 4通道: [vx, vy, rms, confidence]
         sampled = F.grid_sample(
             self._radar_velocity_bev, grid, 
             mode='bilinear', align_corners=False, padding_mode='zeros'
-        )  # [B, 3, num_proposals, 1]
-        sampled = sampled.squeeze(-1)  # [B, 3, num_proposals]
+        )  # [B, 4, num_proposals, 1]
+        sampled = sampled.squeeze(-1)  # [B, 4, num_proposals]
         
-        # 提取速度和置信度
+        # 提取雷达速度
         radar_vel = sampled[:, :2]  # [B, 2, num_proposals]
-        radar_conf = sampled[:, 2:3]  # [B, 1, num_proposals]
+        # 使用RMS通道(通道2)计算物理置信度，而非学习到的通道3
+        # RMS越小→测量越准→置信度越高
+        # confidence = sigmoid(-k * (rms - threshold))
+        rms = sampled[:, 2:3]  # [B, 1, num_proposals]
+        radar_conf = torch.sigmoid(-5.0 * (rms - 0.5)).clamp(0.0, 1.0)
+        
+        # 无雷达点的位置（采样到零）不应参与融合
+        # 利用速度和rms同时为0判断空区域
+        no_radar_mask = (sampled[:, :2].abs().sum(dim=1, keepdim=True) < 1e-6) & \
+                       (rms < 1e-6)
+        radar_conf = radar_conf.masked_fill(no_radar_mask, 0.0)
         
         # 基于置信度的加权融合
-        # 置信度高的位置更信任雷达速度
         fused_vel = radar_conf * radar_vel + (1 - radar_conf) * pred_vel
         
         return fused_vel

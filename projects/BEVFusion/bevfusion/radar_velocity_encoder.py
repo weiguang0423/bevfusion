@@ -206,21 +206,22 @@ class GeometryAwareVelocityEncoder(nn.Module):
             
             # 提取速度不确定度
             # 支持多种输入格式：
-            # - 9维：[x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms, time_delta]
-            # - 8维：[x, y, z, rcs, vx_comp, vy_comp, vx_rms, vy_rms]
-            # - 10维（旧格式）：[x, y, z, rcs, vx_comp, vy_comp, sin_theta, cos_theta, vx_rms, vy_rms]
+            # - 11维（RadarGeometryEnhancer增强后）：
+            #   [x,y,z,rcs,vx_comp,vy_comp,sin_theta,cos_theta,vx_rms,vy_rms,dt]
+            # - 9维（未增强，预处理后原始格式）：
+            #   [x,y,z,rcs,vx_comp,vy_comp,vx_rms,vy_rms,dt]
+            # - 8维：[x,y,z,rcs,vx_comp,vy_comp,vx_rms,vy_rms]
             dim = points.shape[1]
-            if dim >= 9 and dim != 10:
-                # 9维格式（推荐）：vx_rms在索引6，vy_rms在索引7，time_delta在索引8
-                vx_rms = points[:, 6]
-                vy_rms = points[:, 7]
-                # time_delta 可用于后续扩展，目前不参与速度编码
+            if dim == 11:
+                # 11维增强格式：sin_theta在6,cos_theta在7,vx_rms在8,vy_rms在9,dt在10
+                vx_rms = points[:, 8]
+                vy_rms = points[:, 9]
             elif dim == 10:
                 # 10维旧格式：vx_rms在索引8，vy_rms在索引9
                 vx_rms = points[:, 8]
                 vy_rms = points[:, 9]
             elif dim >= 8:
-                # 8维格式：vx_rms在索引6，vy_rms在索引7
+                # 8维或9维未增强格式：vx_rms在索引6，vy_rms在索引7
                 vx_rms = points[:, 6]
                 vy_rms = points[:, 7]
             else:
@@ -238,8 +239,6 @@ class GeometryAwareVelocityEncoder(nn.Module):
             vy_norm = (vy_comp / self.vel_scale).clamp(-10.0, 10.0)
             vx_rms_norm = vx_rms.clamp(min=0.01) / self.rms_scale
             vy_rms_norm = vy_rms.clamp(min=0.01) / self.rms_scale
-            vx_rms_norm = vx_rms / self.rms_scale
-            vy_rms_norm = vy_rms / self.rms_scale
             
             velocity_features = torch.stack([
                 vx_norm, vy_norm, sin_theta, cos_theta, vx_rms_norm, vy_rms_norm

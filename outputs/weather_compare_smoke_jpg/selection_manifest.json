@@ -1,0 +1,72 @@
+{
+  "created_at": "2026-04-08T12:40:47",
+  "seed": 20260408,
+  "score_thr": 0.2,
+  "num_per_weather": 1,
+  "device": "cuda:0",
+  "split_dir": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/weather_eval/ann_splits",
+  "official": {
+    "config": "/root/mmdetection3d-main/projects/BEVFusion/configs/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py",
+    "checkpoint": "/root/mmdetection3d-main/checkpoints/bevfusion_lidar_cam_converted.pth"
+  },
+  "best": {
+    "config": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/bevfusion_lidar-cam-radar_geometry_enhanced_stage2_e12.py",
+    "checkpoint": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/best_NuScenes metric_pred_instances_3d_NuScenes_NDS_epoch_10.pth"
+  },
+  "selection": {
+    "day": {
+      "split_path": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/weather_eval/ann_splits/nuscenes_infos_val_day.pkl",
+      "available_samples": 4449,
+      "samples": [
+        {
+          "order": 1,
+          "index": 1238,
+          "basename": "01_sample001238_04828388",
+          "token": "04828388a55741479c3698cdf6aa2e6c",
+          "sample_idx": 1238,
+          "lidar_path": "n015-2018-07-16-11-49-16+0800__LIDAR_TOP__1531713372899558.pcd.bin",
+          "first_image_path": "n015-2018-07-16-11-49-16+0800__CAM_FRONT__1531713372862460.jpg",
+          "official_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/official/day/01_sample001238_04828388.jpg",
+          "best_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/best/day/01_sample001238_04828388.jpg",
+          "comparison_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/comparison/day/01_sample001238_04828388.jpg"
+        }
+      ]
+    },
+    "rainy": {
+      "split_path": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/weather_eval/ann_splits/nuscenes_infos_val_rain.pkl",
+      "available_samples": 1088,
+      "samples": [
+        {
+          "order": 1,
+          "index": 263,
+          "basename": "01_sample003053_39b08ab1",
+          "token": "39b08ab130fb49998f85ce1c977154ae",
+          "sample_idx": 3053,
+          "lidar_path": "n008-2018-09-18-14-35-12-0400__LIDAR_TOP__1537296046449552.pcd.bin",
+          "first_image_path": "n008-2018-09-18-14-35-12-0400__CAM_FRONT__1537296046412404.jpg",
+          "official_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/official/rainy/01_sample003053_39b08ab1.jpg",
+          "best_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/best/rainy/01_sample003053_39b08ab1.jpg",
+          "comparison_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/comparison/rainy/01_sample003053_39b08ab1.jpg"
+        }
+      ]
+    },
+    "night": {
+      "split_path": "/root/mmdetection3d-main/work_dirs/bevfusion_radar_weather_stage2_final_e12_cameraaware_epoch1/weather_eval/ann_splits/nuscenes_infos_val_night.pkl",
+      "available_samples": 602,
+      "samples": [
+        {
+          "order": 1,
+          "index": 204,
+          "basename": "01_sample005621_3dbf7daf",
+          "token": "3dbf7daf29614311969bd1b9ed3e7e70",
+          "sample_idx": 5621,
+          "lidar_path": "n015-2018-11-21-19-21-35+0800__LIDAR_TOP__1542799523898393.pcd.bin",
+          "first_image_path": "n015-2018-11-21-19-21-35+0800__CAM_FRONT__1542799523862460.jpg",
+          "official_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/official/night/01_sample005621_3dbf7daf.jpg",
+          "best_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/best/night/01_sample005621_3dbf7daf.jpg",
+          "comparison_path": "/root/mmdetection3d-main/outputs/weather_compare_smoke_jpg/comparison/night/01_sample005621_3dbf7daf.jpg"
+        }
+      ]
+    }
+  }
+}

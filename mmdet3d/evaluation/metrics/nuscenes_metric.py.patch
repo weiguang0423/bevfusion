@@ -1,0 +1,9 @@
+--- mmdet3d/evaluation/metrics/nuscenes_metric.py
++++ mmdet3d/evaluation/metrics/nuscenes_metric.py
+@@ -107,7 +107,7 @@
+         self.nusc = NuScenes(version=self.version, dataroot=self.data_root, verbose=True)
+         # We need to manually overwrite the split data
+         # because we use our customized json subset here.
+-        if hasattr(self, 'subset_eval_json') and self.subset_eval_json:
++        if False:
+             pass

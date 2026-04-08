@@ -1,0 +1,5 @@
+# conda environments:
+#
+base                     /home/vipuser/miniconda3
+bevfusion                /home/vipuser/miniconda3/envs/bevfusion
+

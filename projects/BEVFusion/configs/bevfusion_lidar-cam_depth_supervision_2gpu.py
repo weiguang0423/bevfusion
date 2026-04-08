@@ -177,7 +177,7 @@ train_pipeline = [
         type='GridMask',
         use_h=True,
         use_w=True,
-        max_epoch=8,  # 更新为8 epochs
+        max_epoch=10,  # 更新为10 epochs
         rotate=1,
         offset=False,
         ratio=0.5,
@@ -256,53 +256,29 @@ val_dataloader = dict(
     dataset=dict(pipeline=test_pipeline, modality=input_modality))
 test_dataloader = val_dataloader
 
-# ============ 学习率调度器（10 epochs） ============
+# ============ 学习率调度器（断点续训：固定低学习率） ============
+# 仅剩最后 2 个 epoch，使用固定的低学习率确保稳定
 param_scheduler = [
-    # 线性预热
     dict(
-        type='LinearLR',
-        start_factor=0.33333333,
-        by_epoch=False,
+        type='ConstantLR',
+        factor=1.0,
         begin=0,
-        end=500),
-    # 余弦退火学习率
-    dict(
-        type='CosineAnnealingLR',
-        begin=0,
-        T_max=8,  # 8 epochs
-        end=8,
-        by_epoch=True,
-        eta_min_ratio=1e-4,
-        convert_to_iter_based=True),
-    # 动量调度器
-    dict(
-        type='CosineAnnealingMomentum',
-        eta_min=0.85 / 0.95,
-        begin=0,
-        end=3.2,  # 调整为8 epochs的40%
-        by_epoch=True,
-        convert_to_iter_based=True),
-    dict(
-        type='CosineAnnealingMomentum',
-        eta_min=1,
-        begin=3.2,
-        end=8,
-        by_epoch=True,
-        convert_to_iter_based=True)
+        end=10,
+        by_epoch=True)
 ]
 
 # ============ 训练配置（10 epochs） ============
-train_cfg = dict(by_epoch=True, max_epochs=8, val_interval=1)
+train_cfg = dict(by_epoch=True, max_epochs=10, val_interval=1)
 val_cfg = dict()
 test_cfg = dict()
 
-# ============ 优化器配置（分层学习率 + 梯度裁剪） ============
+# ============ 优化器配置（降低学习率） ============
 # 原始配置: 8 GPU x 4 = 32 batch size, lr = 0.0002
 # 当前配置: 2 GPU x 6 = 12 batch size
-# 线性缩放: lr = 0.0002 * (12/32) = 0.000075
+# 断点续训降低学习率: lr = 0.000012（避免调度器异常导致的 LR 暴升）
 optim_wrapper = dict(
     type='AmpOptimWrapper',  # 使用混合精度训练
-    optimizer=dict(type='AdamW', lr=0.000075, weight_decay=0.01),
+    optimizer=dict(type='AdamW', lr=0.000012, weight_decay=0.01),
     # 梯度裁剪：深度监督初期梯度极大，必须限制，防止 NaN
     clip_grad=dict(max_norm=35, norm_type=2),
     loss_scale='dynamic',
@@ -345,9 +321,13 @@ default_hooks = dict(
 del _base_.custom_hooks
 
 # ============ 预训练权重 ============
-# 从已有的 lidar-cam 预训练权重加载
-# 深度监督模块会自动随机初始化
-load_from = 'checkpoints/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth'
+# 断点续训时不需要 load_from，resume 会自动加载权重和训练状态
+# load_from = 'checkpoints/bevfusion_lidar-cam_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d-5239b1af.pth'
 
 # ============ 工作目录 ============
 work_dir = './work_dirs/bevfusion_lidar-cam_depth_supervision_2gpu'
+
+# ============ 断点续训（从第9个 epoch 继续）===========
+# MMEngine 3.x 中，resume 直接设置为 checkpoint 路径
+# 这会自动恢复：模型权重 + 优化器状态 + epoch计数(=8) → 从 epoch 9 开始训练
+resume = './work_dirs/bevfusion_lidar-cam_depth_supervision_2gpu/epoch_8.pth'

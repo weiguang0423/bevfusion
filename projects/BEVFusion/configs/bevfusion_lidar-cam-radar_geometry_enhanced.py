@@ -108,6 +108,12 @@ model = dict(
         out_channels=256,
         reduction=4,  # SE模块通道压缩比
         use_se=[False, False, True],  # 只对Radar分支使用SE（通道数少，容易被淹没）
+        modality_dropout_rate=0.0,   # 默认关闭，Stage2中启用
+        uncertainty_gate=False,      # 默认关闭
+        fusion_warmup_iters=0,       # 默认不做融合渐进，Stage2中启用
+        residual_radar=True,         # 残差雷达融合模式
+        radar_gate_init=0.0,         # radar门控初始值
+        radar_warmup_epochs=2,       # warmup epoch数
     ),
     # 检测头配置：增大速度损失权重
     bbox_head=dict(
